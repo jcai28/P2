@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package dfs;
+
+option go_package = "generated/dfspb";
+
+
+// Enum for different request types
+enum RequestType {
+  HEARTBEAT = 0;
+  ALLOCATE_STORAGE = 1;
+  GET_FILE_LOCATIONS = 2;
+  STORE_CHUNK = 3;
+  RETRIEVE_CHUNK = 4;
+  DELETE_FILE = 5;
+  DELETE_CHUNK = 6; // Add DELETE_CHUNK
+  LIST_FILES = 7;
+  GET_SYSTEM_INFO = 8;
+  ADD_REPLICA = 9;   // New request type for adding a replica
+  REPORT_CORRUPTION = 10; 
+}
+
+// Request message with oneof for different types of requests
+message Request {
+  RequestType type = 1;
+
+  oneof request {
+    HeartbeatRequest heartbeat = 3;
+    AllocateStorageRequest allocate_storage = 4;
+    GetFileLocationsRequest get_file_locations = 5;
+    StoreChunkRequest store_chunk = 6;
+    RetrieveChunkRequest retrieve_chunk = 7;
+    DeleteFileRequest delete_file = 8;
+    DeleteChunkRequest delete_chunk = 9; // Add DeleteChunkRequest
+    ListFilesRequest list_files = 10;
+    GetSystemInfoRequest get_system_info = 11;
+    AddReplicaRequest add_replica = 12;   // New request for adding a replica
+    ReportCorruptedChunkRequest report_corrupted_chunk = 13; // New request for reporting corruption
+  }
+}
+
+// Response message with oneof for different types of responses
+message Response {
+  RequestType type = 1;
+
+  oneof response {
+    HeartbeatResponse heartbeat = 3;
+    AllocateStorageResponse allocate_storage = 4;
+    GetFileLocationsResponse get_file_locations = 5;
+    StoreChunkResponse store_chunk = 6;
+    RetrieveChunkResponse retrieve_chunk = 7;
+    DeleteFileResponse delete_file = 8;
+    DeleteChunkResponse delete_chunk = 9; // Add DeleteChunkResponse
+    ListFilesResponse list_files = 10;
+    GetSystemInfoResponse get_system_info = 11;
+    AddReplicaResponse add_replica = 12;   // New response for adding a replica
+    ReportCorruptedChunkResponse report_corrupted_chunk = 13; // New response for reporting corruption
+  }
+}
+
+// Messages for Heartbeat
+message HeartbeatRequest {
+  StorageNodeInfo node_info = 1;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+// Messages for Storage Allocation
+message AllocateStorageRequest {
+  string filename = 1;
+  int64 file_size = 2;
+  int64 chunk_num = 3;
+}
+
+message AllocateStorageResponse {
+  repeated ChunkAllocation chunk_allocations = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+message ChunkAllocation {
+  string chunk_id = 1;
+  repeated StorageNodeInfo nodes = 2;
+}
+
+// Messages for File Location Retrieval
+message GetFileLocationsRequest {
+  string filename = 1;
+}
+
+message GetFileLocationsResponse {
+  repeated ChunkAllocation chunk_locations = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+// Messages for Chunk Operations
+message StoreChunkRequest {
+  string chunk_id = 1;
+  bytes data = 2;
+  string checksum = 3;
+  repeated StorageNodeInfo nodes = 4;
+}
+
+message StoreChunkResponse {
+  bool success = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+message RetrieveChunkRequest {
+  string chunk_id = 1;
+}
+
+message RetrieveChunkResponse {
+  bytes data = 1;
+  string checksum = 2;
+  string error_message = 3; // Optional error message for failure cases
+}
+
+// Messages for Reporting Corrupted Chunks
+message ReportCorruptedChunkRequest {
+  string chunk_id = 1;
+  string node_id = 2;
+}
+
+message ReportCorruptedChunkResponse {
+  bool acknowledged = 1;
+  StorageNodeInfo healthy_node = 2;
+  string error_message = 3; // Optional error message for failure cases
+}
+
+// Messages for File Deletion
+message DeleteFileRequest {
+  string filename = 1;
+}
+
+message DeleteFileResponse {
+  repeated ChunkAllocation chunk_locations = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+// Messages for Chunk Deletion
+message DeleteChunkRequest {
+  string chunk_id = 1;
+}
+
+message DeleteChunkResponse {
+  bool success = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+
+// Messages for Listing Files
+message ListFilesRequest {}
+
+message ListFilesResponse {
+  repeated string filenames = 1;
+  string error_message = 2; // Optional error message for failure cases
+}
+
+// Messages for System Information Retrieval
+message GetSystemInfoRequest {}
+
+message GetSystemInfoResponse {
+  repeated StorageNodeInfo active_nodes = 1;
+  string error_message = 3; // Optional error message for failure cases
+}
+
+message StorageNodeInfo {
+  string node_id = 1;
+  string address = 2;
+  int64 free_space = 3;
+  int64 total_requests = 4;
+}
+
+// Messages for adding a replica
+message AddReplicaRequest {
+  string chunk_id = 1;                 // The ID of the chunk to replicate
+  StorageNodeInfo target_node = 2;     // The node where the new replica will be created
+}
+
+// Response for adding a replica
+message AddReplicaResponse {
+  bool success = 1;                     // Indicates if the replica creation was successful
+  string error_message = 2;             // Optional error message
+}
