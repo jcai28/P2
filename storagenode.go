@@ -12,6 +12,7 @@ import (
 	"time"
 	"sync"
 	"syscall"
+	"plugin"
 
 	"google.golang.org/protobuf/proto"
 	"dfs/generated/dfspb" // Replace with the actual path
@@ -25,6 +26,7 @@ type StorageNode struct {
 	Conn           net.Conn
 	Mutex          sync.Mutex
 	TotalRequests  int64
+	pluginCache    map[string]func(interface{}, interface{}, func(interface{}, interface{})) error
 }
 
 func NewStorageNode(nodeID, controllerAddr, storageDir, port string) *StorageNode {
@@ -33,6 +35,7 @@ func NewStorageNode(nodeID, controllerAddr, storageDir, port string) *StorageNod
 		ControllerAddr: controllerAddr,
 		StorageDir:     storageDir,
 		Port:           port,
+		pluginCache:    make(map[string]func(interface{}, interface{}, func(interface{}, interface{})) error),
 	}
 }
 
@@ -116,10 +119,134 @@ func (s *StorageNode) handleClientConnection(conn net.Conn) {
 		s.handleDeleteChunk(req.GetDeleteChunk(), conn)
 	case dfspb.RequestType_ADD_REPLICA: // Handle the add replica request
 		s.handleAddReplica(req.GetAddReplica(), conn)
+	case dfspb.RequestType_MAP_JOB: // Handle the Map job request
+		s.handleMapJob(req.GetMapJob(), conn)
 	default:
 		log.Printf("Unknown request type from client")
 	}
 }
+
+func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
+	log.Printf("Received Map job for job ID: %s on chunk ID: %s", mapJob.JobId, mapJob.ChunkId)
+
+	// Load the Map plugin
+	mapFunc, err := s.loadMapPlugin(mapJob.JobId ,mapJob.MapPlugin)
+	if err != nil {
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to load Map plugin")
+		return
+	}
+
+	// Retrieve the chunk data based on chunk ID
+	chunkData, _, err := s.getChunkDataWithChecksum(mapJob.ChunkId)
+	if err != nil {
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to retrieve chunk data")
+		return
+	}
+
+	// Ensure output is written to the specified StorageDir
+	outputFileName := fmt.Sprintf("%s/map_output_%s_%s.txt", s.StorageDir, mapJob.JobId, mapJob.ChunkId)
+
+	file, err := os.OpenFile(outputFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to open output file")
+		return
+	}
+	defer file.Close()
+
+	// Define the emit function to write key-value pairs to the file
+	emit := func(key interface{}, value interface{}) {
+		// Attempt to write the key-value pair to the file
+		_, err := fmt.Fprintf(file, "%v: %v\n", key, value)
+		if err != nil {
+			log.Printf("Failed to write to output file for job %s, chunk %s: %v", mapJob.JobId, mapJob.ChunkId, err)
+		} else {
+			log.Printf("Emitted key-value pair: %v -> %v", key, value)
+		}
+	}
+
+
+	// Execute the Map function on the chunk data, passing the emit function
+	if err = mapFunc(mapJob.ChunkId, chunkData, emit); err != nil {
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Map function execution failed")
+		return
+	}
+	log.Printf("map function excuted successfully ")
+
+	// Send success response to the controller
+	s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, true, "")
+}
+
+// Helper function to send the MapJobResponse
+func (s *StorageNode) sendMapJobResponse(conn net.Conn, jobId, chunkId string, success bool, errorMessage string) {
+	response := &dfspb.Response{
+		Type: dfspb.RequestType_MAP_JOB,
+		Response: &dfspb.Response_MapJob{
+			MapJob: &dfspb.MapJobResponse{
+				JobId:        jobId,
+				ChunkId:      chunkId,
+				Success:      success,
+				ErrorMessage: errorMessage,
+			},
+		},
+	}
+	if err := s.sendResponse(conn, response); err != nil {
+		log.Printf("Failed to send MapJobResponse for job %s: %v", jobId, err)
+	}
+}
+
+
+func (s *StorageNode) loadMapPlugin(jobId string, mapPlugin []byte) (func(interface{}, interface{}, func(interface{}, interface{})) error, error) {
+	// Initialize the plugin cache if it's nil
+	if s.pluginCache == nil {
+		s.pluginCache = make(map[string]func(interface{}, interface{}, func(interface{}, interface{})) error)
+	}
+
+	// Check if the plugin for this jobId is already loaded in cache
+	if mapFunc, exists := s.pluginCache[jobId]; exists {
+		log.Printf("Reusing cached map function for job %s", jobId)
+		return mapFunc, nil
+	}
+
+	// Generate a unique temporary file name for the job
+	tempFile, err := os.CreateTemp("", fmt.Sprintf("map_plugin_%s_*.so", jobId))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name()) // Ensure the file is cleaned up after loading
+
+	// Write the binary data to the temporary file
+	if _, err := tempFile.Write(mapPlugin); err != nil {
+		return nil, fmt.Errorf("failed to write plugin data to file: %v", err)
+	}
+	tempFile.Close()
+
+	// Load the plugin
+	plug, err := plugin.Open(tempFile.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to load plugin: %v", err)
+	}
+
+	// Lookup the Map function
+	symMap, err := plug.Lookup("Map")
+	if err != nil {
+		return nil, fmt.Errorf("failed to find Map function in plugin: %v", err)
+	}
+
+	// Assert that the symbol is of the expected type
+	mapFunc, ok := symMap.(func(interface{}, interface{}, func(interface{}, interface{})) error)
+	if !ok {
+		return nil, fmt.Errorf("plugin Map function has unexpected type")
+	}
+
+	// Cache the map function for this jobId
+	s.pluginCache[jobId] = mapFunc
+
+	log.Printf("Map function loaded and cached for job %s", jobId)
+	return mapFunc, nil
+}
+
+
+
 
 func (s *StorageNode) handleStoreChunk(req *dfspb.StoreChunkRequest, conn net.Conn) {
 	s.Mutex.Lock()
@@ -363,77 +490,72 @@ func (s *StorageNode) handleAddReplica(req *dfspb.AddReplicaRequest, conn net.Co
     return nil
 }
 
-
-
-func (s *StorageNode) handleRetrieveChunk(req *dfspb.RetrieveChunkRequest, conn net.Conn) {
+// getChunkDataWithChecksum retrieves the chunk data and checksum for a given chunk ID.
+// It verifies the integrity of the data by comparing the calculated and stored checksums.
+// If corruption is detected, it can handle recovery if necessary.
+func (s *StorageNode) getChunkDataWithChecksum(chunkID string) ([]byte, string, error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
 	// Construct the file paths for the chunk and checksum
-	chunkFilePath := fmt.Sprintf("%s/%s.chunk", s.StorageDir, req.ChunkId)
-	checksumFilePath := fmt.Sprintf("%s/%s.checksum", s.StorageDir, req.ChunkId)
+	chunkFilePath := fmt.Sprintf("%s/%s.chunk", s.StorageDir, chunkID)
+	checksumFilePath := fmt.Sprintf("%s/%s.checksum", s.StorageDir, chunkID)
 
 	// Check if the chunk file exists
 	if _, err := os.Stat(chunkFilePath); os.IsNotExist(err) {
-		// File does not exist, send error response
-		resp := &dfspb.Response{
-			Type: dfspb.RequestType_RETRIEVE_CHUNK,
-			Response: &dfspb.Response_RetrieveChunk{
-				RetrieveChunk: &dfspb.RetrieveChunkResponse{
-					ErrorMessage: "Chunk not found",
-				},
-			},
-		}
-		s.sendResponse(conn, resp)
-		return
+		return nil, "", fmt.Errorf("chunk not found: %s", chunkID)
 	}
 
-	// Load the chunk from disk
+	// Load the chunk data from disk
 	data, err := ioutil.ReadFile(chunkFilePath)
 	if err != nil {
-		log.Printf("Failed to retrieve chunk: %v", err)
-		// Send error response
-		resp := &dfspb.Response{
-			Type: dfspb.RequestType_RETRIEVE_CHUNK,
-			Response: &dfspb.Response_RetrieveChunk{
-				RetrieveChunk: &dfspb.RetrieveChunkResponse{
-					ErrorMessage: "Failed to read chunk file",
-				},
-			},
-		}
-		s.sendResponse(conn, resp)
-		return
+		return nil, "", fmt.Errorf("failed to read chunk file: %v", err)
 	}
 
 	// Load the checksum from the checksum file
 	storedChecksum, err := ioutil.ReadFile(checksumFilePath)
 	if err != nil {
-		log.Printf("Failed to read checksum file: %v", err)
-		// Send error response
-		resp := &dfspb.Response{
-			Type: dfspb.RequestType_RETRIEVE_CHUNK,
-			Response: &dfspb.Response_RetrieveChunk{
-				RetrieveChunk: &dfspb.RetrieveChunkResponse{
-					ErrorMessage: "Failed to read checksum file",
-				},
-			},
-		}
-		s.sendResponse(conn, resp)
-		return
+		return nil, "", fmt.Errorf("failed to read checksum file: %v", err)
 	}
 
 	// Recalculate the checksum for the loaded chunk data
 	calculatedChecksum := s.calculateChecksum(data)
 
-	// Check if the recalculated checksum matches the stored checksum
+	// Verify if the recalculated checksum matches the stored checksum
 	if string(storedChecksum) != calculatedChecksum {
-		log.Printf("Data corruption detected for chunk %s", req.ChunkId)
-		// Handle corruption by sending a recovery request to the controller
-		data = s.handleCorruption(req.ChunkId)
+		log.Printf("Data corruption detected for chunk %s", chunkID)
+		// Attempt recovery by calling handleCorruption
+		data = s.handleCorruption(chunkID)
 		if data == nil {
-			log.Println("Data corruption handle failed")
-			return
+			return nil, "", fmt.Errorf("data corruption could not be handled for chunk: %s", chunkID)
 		}
+		// Update the checksum after recovery
+		calculatedChecksum = s.calculateChecksum(data)
+	}
+	log.Printf("Data read success for chunk %s", chunkID)
+
+	return data, calculatedChecksum, nil
+}
+
+
+
+func (s *StorageNode) handleRetrieveChunk(req *dfspb.RetrieveChunkRequest, conn net.Conn) {
+	
+	// Retrieve the chunk data and checksum
+	data, checksum, err := s.getChunkDataWithChecksum(req.ChunkId)
+	if err != nil {
+		log.Printf("Failed to retrieve chunk %s: %v", req.ChunkId, err)
+		// Send error response
+		resp := &dfspb.Response{
+			Type: dfspb.RequestType_RETRIEVE_CHUNK,
+			Response: &dfspb.Response_RetrieveChunk{
+				RetrieveChunk: &dfspb.RetrieveChunkResponse{
+					ErrorMessage: err.Error(),
+				},
+			},
+		}
+		s.sendResponse(conn, resp)
+		return
 	}
 
 
@@ -447,7 +569,7 @@ func (s *StorageNode) handleRetrieveChunk(req *dfspb.RetrieveChunkRequest, conn 
 		Response: &dfspb.Response_RetrieveChunk{
 			RetrieveChunk: &dfspb.RetrieveChunkResponse{
 				Data:     data,
-				Checksum: string(storedChecksum),
+				Checksum: string(checksum),
 			},
 		},
 	}

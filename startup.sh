@@ -25,7 +25,7 @@ for (( i = 0; i < nodes; i++ )); do
 
     # This will ssh to the machine and run 'node' on the assigned server/port
     echo "Starting node on ${servers[${server}]} on port ${port}"
-    ssh ${servers[${server}]} "${HOME}/P1-Template/node ${i} /bigdata/students/$(whoami) ${port}" &
+    ssh ${servers[${server}]} "${HOME}/P2/node ${i} /bigdata/students/$(whoami) ${port}" &
 done
 
 echo "Startup complete"

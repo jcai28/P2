@@ -18,11 +18,20 @@ import (
 
 // Controller struct will store the list of active storage nodes and file-to-chunk mappings
 type Controller struct {
-	StorageNodes   map[string]*pb.StorageNodeInfo // Node ID to Node Info mapping
+	StorageNodes   map[string]*pb.StorageNodeInfo   // Node ID to Node Info mapping
 	NodesHeartbeat map[string]time.Time             // Last heartbeat times
 	FileChunkMap   map[string][]*pb.ChunkAllocation // Filename to chunk locations
-	NodeChunks     map[string][]string              // node id to chunk id list 
+	NodeChunks     map[string][]string              // Node ID to chunk ID list
+	ChunkFileMap   map[string]ChunkFileInfo         // Chunk ID to file and chunk number mapping
+	nodeWorkload   map[string]int
+	jobStatus       map[string]map[string]bool
 	Mutex          sync.Mutex                       // To prevent race conditions
+}
+
+// ChunkFileInfo stores file name and chunk number for a given chunk ID
+type ChunkFileInfo struct {
+	Filename  string
+	ChunkNum  int64
 }
 
 // NewController creates a new controller
@@ -32,6 +41,9 @@ func NewController() *Controller {
 		NodesHeartbeat: make(map[string]time.Time),
 		FileChunkMap:   make(map[string][]*pb.ChunkAllocation),
 		NodeChunks:     make(map[string][]string),
+		ChunkFileMap:   make(map[string]ChunkFileInfo), // Initialize the new map
+		nodeWorkload:   make(map[string]int),
+		jobStatus:      make(map[string]map[string]bool),
 	}
 }
 
@@ -40,17 +52,15 @@ func (c *Controller) removeNodeFromAllocations(nodeID string) {
 
 	if chunks, exists := c.NodeChunks[nodeID]; exists {
 		for _, chunkID := range chunks {
-			// Extract filename and index from chunkID
-			parts := strings.Split(chunkID, "_")
-			if len(parts) < 2 {
-				continue // Invalid format, skip
+			chunkFileInfo, exists := c.ChunkFileMap[chunkID]
+			if !exists {
+				continue // If no mapping exists for this chunkID, skip
 			}
-			filename := parts[0]
-			index, err := strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				continue // If parsing fails, skip
-			}
-			fmt.Printf("removing for file%s, index%d\n", filename, index)
+
+			filename := chunkFileInfo.Filename
+			index := chunkFileInfo.ChunkNum
+			fmt.Printf("Removing for file %s, index %d\n", filename, index)
+
 			
 			// Access the chunk allocations for this filename
 			chunkAllocations, exists := c.FileChunkMap[filename]
@@ -419,6 +429,12 @@ func (c *Controller) handleAllocateStorage(req *pb.AllocateStorageRequest, conn 
 			ChunkId: chunkID,
 			Nodes:   nodeInfos,
 		}
+
+		// Map the chunk ID to its file name and chunk number in ChunkFileMap
+		c.ChunkFileMap[chunkID] = ChunkFileInfo{
+		Filename: req.Filename,
+		ChunkNum: i,
+	}
 	}
 
 	// Store the file-to-chunk mappings
@@ -467,7 +483,6 @@ func (c *Controller) handleGetFileLocations(req *pb.GetFileLocationsRequest, con
 func (c *Controller) handleClientConnection(conn net.Conn) {
 	defer conn.Close()
 
-
 	// Read the incoming message
 	req, err := c.readRequest(conn)
 	if err != nil {
@@ -477,7 +492,7 @@ func (c *Controller) handleClientConnection(conn net.Conn) {
 
 	switch req.Type {
 	case pb.RequestType_ALLOCATE_STORAGE:
-		log.Printf("Received allocation storage request")
+		log.Printf("Received allocate storage request")
 		c.handleAllocateStorage(req.GetAllocateStorage(), conn)
 	case pb.RequestType_GET_FILE_LOCATIONS:
 		c.handleGetFileLocations(req.GetGetFileLocations(), conn)
@@ -490,11 +505,199 @@ func (c *Controller) handleClientConnection(conn net.Conn) {
 	case pb.RequestType_GET_SYSTEM_INFO:
 		log.Printf("Received system info request")
 		c.handleGetSystemInfo(conn)
+	case pb.RequestType_MAP_REDUCE_JOB:
+		log.Printf("Received MapReduce job request")
+		c.handleMapReduceJob(req.GetMapReduceJob(), conn) // Handle MapReduce job
 	default:
 		log.Printf("Unknown request type from client")
 	}
-	
 }
+
+func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net.Conn) {
+	// Validate the MapReduce job request parameters
+	if jobReq == nil || jobReq.InputFile == "" || len(jobReq.MapPlugin) == 0 || len(jobReq.ReducePlugin) == 0 {
+		log.Printf("Invalid MapReduce job request")
+		c.sendResponse(conn, &pb.Response{
+			Type: pb.RequestType_MAP_REDUCE_JOB,
+			Response: &pb.Response_MapReduceJob{
+				MapReduceJob: &pb.MapReduceJobResponse{
+					JobId:        jobReq.JobId,
+					Success:      false,
+					ErrorMessage: "Invalid MapReduce job request",
+				},
+			},
+		})
+		return
+	}
+
+	log.Printf("Starting MapReduce job: %s for file: %s", jobReq.JobId, jobReq.InputFile)
+
+	// Step 1: Locate chunks for the input file
+	chunkAllocations, exists := c.FileChunkMap[jobReq.InputFile]
+	if !exists {
+		log.Printf("No chunks found for input file %s", jobReq.InputFile)
+		c.sendResponse(conn, &pb.Response{
+			Type: pb.RequestType_MAP_REDUCE_JOB,
+			Response: &pb.Response_MapReduceJob{
+				MapReduceJob: &pb.MapReduceJobResponse{
+					JobId:        jobReq.JobId,
+					Success:      false,
+					ErrorMessage: "Input file not found",
+				},
+			},
+		})
+		return
+	}
+
+	c.jobStatus[jobReq.JobId] = make(map[string]bool)
+	var wg sync.WaitGroup
+
+	// Step 2: Send plugins and job details to one node per chunk
+	for idx, chunk := range chunkAllocations {
+		if len(chunk.Nodes) == 0 {
+			continue // No available nodes for this chunk, skip it
+		}
+
+		// Pick the first available node for this chunk
+		selectedNode := c.selectNodeForChunk(chunk)
+		chunkID := fmt.Sprintf("%s_%d", jobReq.InputFile, idx)
+		c.jobStatus[jobReq.JobId][chunkID] = false // Mark as incomplete
+
+		wg.Add(1)
+		go func(node *pb.StorageNodeInfo, jobId, chunkID string) {
+			defer wg.Done()
+
+			// Send the job to the storage node
+			c.sendJobToStorageNode(node, jobId, jobReq.MapPlugin, jobReq.ReducePlugin, chunkID)
+
+		}(selectedNode, jobReq.JobId, chunkID)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Step 4: Check if all chunks are complete
+	allComplete := true
+	for _, complete := range c.jobStatus[jobReq.JobId] {
+		if !complete {
+			allComplete = false
+			break
+		}
+	}
+
+	// Respond to the client based on job completion status
+	if allComplete {
+		log.Printf("MapReduce job %s completed successfully", jobReq.JobId)
+		c.sendResponse(conn, &pb.Response{
+			Type: pb.RequestType_MAP_REDUCE_JOB,
+			Response: &pb.Response_MapReduceJob{
+				MapReduceJob: &pb.MapReduceJobResponse{
+					JobId:   jobReq.JobId,
+					Success: true,
+				},
+			},
+		})
+	} else {
+		log.Printf("MapReduce job %s failed", jobReq.JobId)
+		c.sendResponse(conn, &pb.Response{
+			Type: pb.RequestType_MAP_REDUCE_JOB,
+			Response: &pb.Response_MapReduceJob{
+				MapReduceJob: &pb.MapReduceJobResponse{
+					JobId:        jobReq.JobId,
+					Success:      false,
+					ErrorMessage: "One or more chunks failed",
+				},
+			},
+		})
+	}
+
+	// Clean up job status after completion
+	delete(c.jobStatus, jobReq.JobId)
+}
+
+
+func (c *Controller) selectNodeForChunk(chunk *pb.ChunkAllocation) *pb.StorageNodeInfo {
+	var selectedNode *pb.StorageNodeInfo
+	minWorkload := int(^uint(0) >> 1) // Initialize with max int for comparison
+
+	// Check if there are nodes available in the chunk
+	if len(chunk.Nodes) == 0 {
+		return nil // No nodes to select from, return nil
+	}
+
+	// Iterate over available nodes for this chunk
+	for _, node := range chunk.Nodes {
+		workload := c.nodeWorkload[node.NodeId]
+		if workload < minWorkload {
+			selectedNode = node
+			minWorkload = workload
+		}
+	}
+
+	return selectedNode
+}
+
+
+func (c *Controller) sendJobToStorageNode(
+	node *pb.StorageNodeInfo,
+	jobId string,
+	mapPlugin []byte,
+	reducePlugin []byte,
+	chunkID string,
+) error {
+	// Update job status and node workload safely
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+
+	// Connect to the storage node
+	conn, err := net.Dial("tcp", node.Address)
+	if err != nil {
+		return fmt.Errorf("failed to connect to storage node %s: %v", node.NodeId, err)
+	}
+	defer conn.Close()
+
+
+	// Create the MapJobRequest
+	mapJobRequest := &pb.Request{
+		Type: pb.RequestType_MAP_JOB,
+		Request: &pb.Request_MapJob{
+			MapJob: &pb.MapJobRequest{
+				JobId:     jobId,
+				ChunkId:   chunkID,
+				MapPlugin: mapPlugin,
+			},
+		},
+	}
+
+	// Send the MapJobRequest to the storage node
+	if err := c.sendRequest(conn, mapJobRequest); err != nil {
+		return fmt.Errorf("failed to send MapJobRequest to node %s: %v", node.NodeId, err)
+	}
+	c.nodeWorkload[node.NodeId]++       // Increment workload count for the node
+	log.Printf("Sent Map job request for job %s to storage node %s", jobId, node.NodeId)
+
+	// Wait for the MapJobResponse from the storage node
+	response, err := c.readResponse(conn)
+	if err != nil {
+		return fmt.Errorf("failed to receive response from node %s: %v", node.NodeId, err)
+	}
+
+	// Process the MapJobResponse
+	mapJobResponse := response.GetMapJob()
+
+	// Check the response status and update the job status accordingly
+	if mapJobResponse.Success {
+		// Update job status to mark this chunk as complete
+		c.jobStatus[jobId][chunkID] = true
+		c.nodeWorkload[node.NodeId]-- 
+		log.Printf("Map job %s for chunk %s completed successfully on node %s", jobId, chunkID, node.NodeId)
+	} else {
+		return fmt.Errorf("map job %s for chunk %s failed on node %s: %s", jobId, chunkID, node.NodeId, mapJobResponse.ErrorMessage)
+	}
+
+	return nil
+}
+
 
 // Handle file deletion request
 func (c *Controller) handleDeleteFile(req *pb.DeleteFileRequest, conn net.Conn) {

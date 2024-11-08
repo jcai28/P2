@@ -4,7 +4,6 @@ package dfs;
 
 option go_package = "generated/dfspb";
 
-
 // Enum for different request types
 enum RequestType {
   HEARTBEAT = 0;
@@ -13,11 +12,14 @@ enum RequestType {
   STORE_CHUNK = 3;
   RETRIEVE_CHUNK = 4;
   DELETE_FILE = 5;
-  DELETE_CHUNK = 6; // Add DELETE_CHUNK
+  DELETE_CHUNK = 6;
   LIST_FILES = 7;
   GET_SYSTEM_INFO = 8;
-  ADD_REPLICA = 9;   // New request type for adding a replica
-  REPORT_CORRUPTION = 10; 
+  ADD_REPLICA = 9;
+  REPORT_CORRUPTION = 10;
+  MAP_REDUCE_JOB = 11;     // Client to Controller: Request to start a MapReduce job
+  MAP_JOB = 12;            // Controller to Storage Node: Request to start a Map job on a chunk
+  REDUCE_JOB = 13;         // Controller to Storage Node: Request to start a Reduce job
 }
 
 // Request message with oneof for different types of requests
@@ -31,11 +33,14 @@ message Request {
     StoreChunkRequest store_chunk = 6;
     RetrieveChunkRequest retrieve_chunk = 7;
     DeleteFileRequest delete_file = 8;
-    DeleteChunkRequest delete_chunk = 9; // Add DeleteChunkRequest
+    DeleteChunkRequest delete_chunk = 9;               // DeleteChunkRequest
     ListFilesRequest list_files = 10;
     GetSystemInfoRequest get_system_info = 11;
-    AddReplicaRequest add_replica = 12;   // New request for adding a replica
-    ReportCorruptedChunkRequest report_corrupted_chunk = 13; // New request for reporting corruption
+    AddReplicaRequest add_replica = 12;                // Add replica request
+    ReportCorruptedChunkRequest report_corrupted_chunk = 13; // Report corruption request
+    MapReduceJobRequest map_reduce_job = 14;           // MapReduce job request
+    MapJobRequest map_job = 15;                        // Map job request for storage nodes
+    ReduceJobRequest reduce_job = 16;                  // Reduce job request for storage nodes
   }
 }
 
@@ -50,13 +55,67 @@ message Response {
     StoreChunkResponse store_chunk = 6;
     RetrieveChunkResponse retrieve_chunk = 7;
     DeleteFileResponse delete_file = 8;
-    DeleteChunkResponse delete_chunk = 9; // Add DeleteChunkResponse
+    DeleteChunkResponse delete_chunk = 9;               // DeleteChunkResponse
     ListFilesResponse list_files = 10;
     GetSystemInfoResponse get_system_info = 11;
-    AddReplicaResponse add_replica = 12;   // New response for adding a replica
-    ReportCorruptedChunkResponse report_corrupted_chunk = 13; // New response for reporting corruption
+    AddReplicaResponse add_replica = 12;                // Add replica response
+    ReportCorruptedChunkResponse report_corrupted_chunk = 13; // Report corruption response
+    MapReduceJobResponse map_reduce_job = 14;           // MapReduce job response
+    MapJobResponse map_job = 15;                        // Map job response from storage nodes
+    ReduceJobResponse reduce_job = 16;                  // Reduce job response from storage nodes
   }
 }
+
+
+// Message for requesting a MapReduce job from client to controller
+message MapReduceJobRequest {
+    string job_id = 1;
+    string input_file = 2;
+    bytes map_plugin = 3;
+    bytes reduce_plugin = 4;
+}
+
+// Message for requesting a Map job from controller to storage node
+message MapJobRequest {
+    string job_id = 1;            // Unique identifier for the MapReduce job
+    string chunk_id = 2;          // Chunk to be processed by the Map job
+    bytes map_plugin = 3;         // Binary data of the map plugin file
+    //add redeucers info 
+}
+
+// Response message from the storage node after processing a Map job
+message MapJobResponse {
+    string job_id = 1;            // Unique identifier for the MapReduce job
+    string chunk_id = 2;          // Chunk that was processed
+    bool success = 3;             // Indicates if the Map job was successful
+    string error_message = 4;     // Error message, if any
+}
+
+// Message for requesting a Reduce job from controller to storage node
+message ReduceJobRequest {
+    string job_id = 1;             // Unique identifier for the MapReduce job
+    string key = 2;                // Key for which to apply the Reduce function
+    repeated bytes values = 3;     // Values associated with this key, grouped from Map output
+    bytes reduce_plugin = 4;       // Binary data of the reduce plugin file
+}
+
+// Response message from the storage node after processing a Reduce job
+message ReduceJobResponse {
+    string job_id = 1;             // Unique identifier for the MapReduce job
+    string key = 2;                // Key that was reduced
+    bool success = 3;              // Indicates if the Reduce job was successful
+    string result = 4;             // Result of the Reduce job for this key
+    string error_message = 5;      // Error message, if any
+}
+
+// Response message for MapReduce job request
+message MapReduceJobResponse {
+    string job_id = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+
 
 // Messages for Heartbeat
 message HeartbeatRequest {
