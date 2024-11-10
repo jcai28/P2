@@ -515,7 +515,7 @@ func (c *Controller) handleClientConnection(conn net.Conn) {
 
 func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net.Conn) {
 	// Validate the MapReduce job request parameters
-	if jobReq == nil || jobReq.InputFile == "" || len(jobReq.MapPlugin) == 0 || len(jobReq.ReducePlugin) == 0 {
+	if jobReq == nil || jobReq.InputFile == "" || len(jobReq.Plugin) == 0 {
 		log.Printf("Invalid MapReduce job request")
 		c.sendResponse(conn, &pb.Response{
 			Type: pb.RequestType_MAP_REDUCE_JOB,
@@ -561,6 +561,7 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 		// Pick the first available node for this chunk
 		selectedNode := c.selectNodeForChunk(chunk)
 		chunkID := fmt.Sprintf("%s_%d", jobReq.InputFile, idx)
+		c.nodeWorkload[selectedNode.NodeId]++
 		c.jobStatus[jobReq.JobId][chunkID] = false // Mark as incomplete
 
 		wg.Add(1)
@@ -568,8 +569,14 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 			defer wg.Done()
 
 			// Send the job to the storage node
-			c.sendJobToStorageNode(node, jobId, jobReq.MapPlugin, jobReq.ReducePlugin, chunkID)
-
+			success := c.sendJobToStorageNode(node, jobId, jobReq.Plugin, chunkID, jobReq.ReducerNum)
+				// Update job status and node workload safely
+			c.Mutex.Lock()
+			defer c.Mutex.Unlock()
+			if (success){
+				c.jobStatus[jobId][chunkID] = true
+				c.nodeWorkload[node.NodeId]-- 
+			}
 		}(selectedNode, jobReq.JobId, chunkID)
 	}
 
@@ -641,45 +648,43 @@ func (c *Controller) selectNodeForChunk(chunk *pb.ChunkAllocation) *pb.StorageNo
 func (c *Controller) sendJobToStorageNode(
 	node *pb.StorageNodeInfo,
 	jobId string,
-	mapPlugin []byte,
-	reducePlugin []byte,
+	plugin []byte,
 	chunkID string,
-) error {
-	// Update job status and node workload safely
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
-
+	reducerNum int32,
+) bool {
 	// Connect to the storage node
 	conn, err := net.Dial("tcp", node.Address)
 	if err != nil {
-		return fmt.Errorf("failed to connect to storage node %s: %v", node.NodeId, err)
+		log.Printf("Failed to connect to storage node %s: %v", node.NodeId, err)
+		return false
 	}
 	defer conn.Close()
 
-
-	// Create the MapJobRequest
+	// Create the MapJobRequest with the updated fields
 	mapJobRequest := &pb.Request{
 		Type: pb.RequestType_MAP_JOB,
 		Request: &pb.Request_MapJob{
 			MapJob: &pb.MapJobRequest{
-				JobId:     jobId,
-				ChunkId:   chunkID,
-				MapPlugin: mapPlugin,
+				JobId:      jobId,
+				ChunkId:    chunkID,
+				Plugin:     plugin,        // Combined plugin containing both Map and Reduce functions
+				ReducerNum: reducerNum,   // Number of reducers for the job
 			},
 		},
 	}
 
 	// Send the MapJobRequest to the storage node
 	if err := c.sendRequest(conn, mapJobRequest); err != nil {
-		return fmt.Errorf("failed to send MapJobRequest to node %s: %v", node.NodeId, err)
+		log.Printf("Failed to send MapJobRequest to node %s: %v", node.NodeId, err)
+		return false
 	}
-	c.nodeWorkload[node.NodeId]++       // Increment workload count for the node
 	log.Printf("Sent Map job request for job %s to storage node %s", jobId, node.NodeId)
 
 	// Wait for the MapJobResponse from the storage node
 	response, err := c.readResponse(conn)
 	if err != nil {
-		return fmt.Errorf("failed to receive response from node %s: %v", node.NodeId, err)
+		log.Printf("Failed to receive response from node %s: %v", node.NodeId, err)
+		return false
 	}
 
 	// Process the MapJobResponse
@@ -687,16 +692,14 @@ func (c *Controller) sendJobToStorageNode(
 
 	// Check the response status and update the job status accordingly
 	if mapJobResponse.Success {
-		// Update job status to mark this chunk as complete
-		c.jobStatus[jobId][chunkID] = true
-		c.nodeWorkload[node.NodeId]-- 
 		log.Printf("Map job %s for chunk %s completed successfully on node %s", jobId, chunkID, node.NodeId)
+		return true
 	} else {
-		return fmt.Errorf("map job %s for chunk %s failed on node %s: %s", jobId, chunkID, node.NodeId, mapJobResponse.ErrorMessage)
+		log.Printf("Map job %s for chunk %s failed on node %s: %s", jobId, chunkID, node.NodeId, mapJobResponse.ErrorMessage)
+		return false
 	}
-
-	return nil
 }
+
 
 
 // Handle file deletion request

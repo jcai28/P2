@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"strconv"
 )
 
 // Map function for word count
@@ -25,3 +26,35 @@ func Map(key interface{}, value interface{}, emit func(interface{}, interface{})
 
 	return nil
 }
+
+// Updated Reduce function for word count
+// Takes a key (word) and a slice of values (each as []byte), parses each to an integer, and emits the total count for the word.
+func Reduce(key interface{}, values []interface{}, emit func(interface{}, interface{})) error {
+	word, ok := key.(string)
+	if !ok {
+		return fmt.Errorf("expected string key, got %T", key)
+	}
+
+	// Sum up the counts for this word, treating each value as []byte
+	totalCount := 0
+	for _, value := range values {
+		// Assert the type to []byte and parse it as an integer
+		byteValue, ok := value.([]byte)
+		if !ok {
+			return fmt.Errorf("expected []byte value, got %T", value)
+		}
+
+		// Convert the []byte to an integer
+		count, err := strconv.Atoi(string(byteValue))
+		if err != nil {
+			return fmt.Errorf("failed to parse count for key %s: %v", word, err)
+		}
+
+		totalCount += count
+	}
+
+	// Emit the final count for the word
+	emit(word, totalCount)
+	return nil
+}
+

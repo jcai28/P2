@@ -46,7 +46,12 @@ func (c *Client) handlePut(filename string, chunkSize int) {
 
 	// Determine if file is text-based for line-based chunking
 	isTextFile := c.isTextFile(file)
-	chunks := c.chunkFile(file, chunkSize, isTextFile) // Pre-chunk the file here
+	chunks, chunkErr := c.chunkFile(file, chunkSize, isTextFile)
+	if chunkErr != nil {
+		log.Fatalf("Failed to chunk file: %v", chunkErr)
+		return
+	}
+
 	chunkNum := int64(len(chunks)) // Get actual number of chunks after chunking
 
 	// Send ALLOCATE_STORAGE request
@@ -148,66 +153,78 @@ func (c *Client) isTextFile(file *os.File) bool {
 	return false // Return false if the extension doesn't match any text types
 }
 
-func (c *Client) chunkFile(file *os.File, chunkSize int, isTextFile bool) [][]byte {
-	var chunks [][]byte
-	if isTextFile {
-		reader := bufio.NewReader(file)
-		
-		for {
-			// Read an initial buffer of chunkSize bytes
-			initialBuffer := make([]byte, chunkSize)
-			n, err := reader.Read(initialBuffer)
-			if n > 0 {
-				initialBuffer = initialBuffer[:n] // Adjust initialBuffer to actual read size
-
-				// Continue reading until the end of the current line
-				lineEnd, lineErr := reader.ReadBytes('\n')
-				if lineErr != nil && lineErr != io.EOF {
-					log.Fatalf("Error reading file to complete line: %v", lineErr)
-				}
-
-				// Create a new buffer to hold the initial buffer plus the line end
-				completeChunk := make([]byte, len(initialBuffer)+len(lineEnd))
-				copy(completeChunk, initialBuffer)
-				copy(completeChunk[len(initialBuffer):], lineEnd)
-
-				// Add the completed chunk to chunks
-				chunks = append(chunks, completeChunk)
-				
-				// Stop processing if we reached EOF after the last line
-				if lineErr == io.EOF {
-					break
-				}
-			}
-
-			// Break if the initial read reaches EOF
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Fatalf("Error reading file: %v", err)
-			}
-		}
-	} else {
-		// Binary file handling remains the same as in Project 1
-		buffer := make([]byte, chunkSize)
-		for {
-			n, err := file.Read(buffer)
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buffer[:n])
-				chunks = append(chunks, chunk)
-			}
-			
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Fatalf("Failed to read file: %v", err)
-			}
-		}
-	}
-	return chunks
+func (c *Client) chunkFile(file *os.File, chunkSize int, isTextFile bool) ([][]byte, error) {
+    var chunks [][]byte
+    
+    if isTextFile {
+        // Create a reader with a buffer size at least as large as our chunk size
+        reader := bufio.NewReaderSize(file, chunkSize)
+        buffer := make([]byte, chunkSize)
+        
+        for {
+            // Read full chunk directly from file
+            n, err := io.ReadFull(reader, buffer)
+            if n > 0 {
+                currentChunk := buffer[:n]
+                
+                // If chunk doesn't end with newline, read until we find one
+                if currentChunk[len(currentChunk)-1] != '\n' {
+                    lineEnd, err := reader.ReadBytes('\n')
+                    if len(lineEnd) > 0 {
+                        // Create complete chunk with the line ending
+                        completeChunk := make([]byte, len(currentChunk)+len(lineEnd))
+                        copy(completeChunk, currentChunk)
+                        copy(completeChunk[len(currentChunk):], lineEnd)
+                        chunks = append(chunks, completeChunk)
+                    } else {
+                        // No more data, use current chunk as is
+                        chunk := make([]byte, len(currentChunk))
+                        copy(chunk, currentChunk)
+                        chunks = append(chunks, chunk)
+                    }
+                    
+                    if err == io.EOF {
+                        break
+                    }
+                    if err != nil && err != io.EOF {
+                        return nil, fmt.Errorf("error reading line end: %w", err)
+                    }
+                } else {
+                    // Current chunk ends with newline
+                    chunk := make([]byte, len(currentChunk))
+                    copy(chunk, currentChunk)
+                    chunks = append(chunks, chunk)
+                }
+            }
+            
+            // Handle the various error cases from ReadFull
+            if err == io.EOF || err == io.ErrUnexpectedEOF {
+                break
+            }
+            if err != nil {
+                return nil, fmt.Errorf("error reading chunk: %w", err)
+            }
+        }
+    } else {
+        buffer := make([]byte, chunkSize)
+        for {
+            n, err := file.Read(buffer)
+            if n > 0 {
+                chunk := make([]byte, n)
+                copy(chunk, buffer[:n])
+                chunks = append(chunks, chunk)
+            }
+            
+            if err == io.EOF {
+                break
+            }
+            if err != nil {
+                return nil, fmt.Errorf("error reading binary file: %w", err)
+            }
+        }
+    }
+    
+    return chunks, nil
 }
 
 
@@ -531,17 +548,11 @@ func (c *Client) deleteChunkFromNode(chunkID, nodeAddr string) {
 	}
 }
 
-func (c *Client) sendMapReduceJobRequest(jobID, inputFilePath, mapPluginPath, reducePluginPath string) error {
-	// Read and load the Map plugin file
-	mapPluginData, err := os.ReadFile(mapPluginPath)
+func (c *Client) sendMapReduceJobRequest(jobID string, inputFilePath string, pluginPath string, reducerNum int) error {
+	// Read and load the plugin file
+	pluginData, err := os.ReadFile(pluginPath)
 	if err != nil {
-		return fmt.Errorf("failed to read map plugin: %v", err)
-	}
-	
-	// Read and load the Reduce plugin file
-	reducePluginData, err := os.ReadFile(reducePluginPath)
-	if err != nil {
-		return fmt.Errorf("failed to read reduce plugin: %v", err)
+		return fmt.Errorf("failed to read plugin file: %v", err)
 	}
 
 	// Establish a connection to the controller
@@ -552,15 +563,18 @@ func (c *Client) sendMapReduceJobRequest(jobID, inputFilePath, mapPluginPath, re
 	defer conn.Close()
 
 	// Construct the MapReduceJobRequest
+	mapReduceJobRequest := &dfspb.MapReduceJobRequest{
+		JobId:      jobID,
+		InputFile:  inputFilePath,
+		Plugin:     pluginData,
+		ReducerNum: int32(reducerNum),
+	}
+
+	// Wrap the MapReduceJobRequest in a generic Request with type set to map_reduce_job
 	req := &dfspb.Request{
-		Type: dfspb.RequestType_MAP_REDUCE_JOB,
+		Type: dfspb.RequestType_MAP_REDUCE_JOB, // Set the request type appropriately
 		Request: &dfspb.Request_MapReduceJob{
-			MapReduceJob: &dfspb.MapReduceJobRequest{
-				JobId:         jobID,
-				InputFile:     inputFilePath,
-				MapPlugin:     mapPluginData,
-				ReducePlugin:  reducePluginData,
-			},
+			MapReduceJob: mapReduceJobRequest,
 		},
 	}
 
@@ -584,8 +598,6 @@ func (c *Client) sendMapReduceJobRequest(jobID, inputFilePath, mapPluginPath, re
 	log.Printf("MapReduce job %s submitted successfully.", jobID)
 	return nil
 }
-
-
 
 // Send a protobuf request over the connection
 func (c *Client) sendRequest(conn net.Conn, req *dfspb.Request) error {
@@ -644,7 +656,7 @@ func main() {
 	switch strings.ToLower(action) {
 	case "put":
 		filename := os.Args[2]
-		chunkSize := 6// Default chunk size is 10 MB
+		chunkSize := 30// Default chunk size is 10 MB
 		if len(os.Args) == 4 {
 			size, err := strconv.Atoi(os.Args[3])
 			if err != nil || size <= 0 {
@@ -678,21 +690,30 @@ func main() {
 	case "system":
 		client.handleSystemInfo()
 	case "mapreduce":
-		if len(os.Args) < 6 {
-			log.Fatalf("Usage for mapreduce: %s mapreduce <jobID> <inputFile> <mapPluginPath> <reducePluginPath> [chunkSize]", os.Args[0])
+		if len(os.Args) < 5 {
+			log.Fatalf("Usage for mapreduce: %s mapreduce <jobID> <inputFile> <pluginPath> [reducerNum] [chunkSize]", os.Args[0])
 		}
 	
 		jobID := os.Args[2]
 		inputFilePath := os.Args[3]
-		mapPluginPath := os.Args[4]
-		reducePluginPath := os.Args[5]
-
+		pluginPath := os.Args[4]
+	
+		// Default reducerNum to a reasonable default (e.g., 1) if not specified
+		reducerNum := 1
+		if len(os.Args) >= 6 {
+			var err error
+			reducerNum, err = strconv.Atoi(os.Args[5])
+			if err != nil {
+				log.Fatalf("Invalid reducerNum: %v", err)
+			}
+		}
+	
 		// Then, send MapReduce job request
-		err := client.sendMapReduceJobRequest(jobID, inputFilePath, mapPluginPath, reducePluginPath)
+		err := client.sendMapReduceJobRequest(jobID, inputFilePath, pluginPath, reducerNum)
 		if err != nil {
 			log.Fatalf("Failed to submit MapReduce job: %v", err)
 		}
-		log.Printf("MapReduce job %s submitted successfully.", jobID)
+		log.Printf("MapReduce job %s submitted successfully with %d reducers.", jobID, reducerNum)
 	
 	default:
 		log.Fatalf("Invalid action: %s. Must be one of: put, get, delete, list, system", action)

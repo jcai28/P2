@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"bufio"
+	"bytes"
 	"log"
 	"net"
 	"os"
 	"time"
 	"sync"
+	"strings"
+	"sort"
 	"syscall"
 	"plugin"
 
@@ -26,7 +30,7 @@ type StorageNode struct {
 	Conn           net.Conn
 	Mutex          sync.Mutex
 	TotalRequests  int64
-	pluginCache    map[string]func(interface{}, interface{}, func(interface{}, interface{})) error
+	pluginCache    map[string]MapReduceFunctions
 }
 
 func NewStorageNode(nodeID, controllerAddr, storageDir, port string) *StorageNode {
@@ -35,8 +39,18 @@ func NewStorageNode(nodeID, controllerAddr, storageDir, port string) *StorageNod
 		ControllerAddr: controllerAddr,
 		StorageDir:     storageDir,
 		Port:           port,
-		pluginCache:    make(map[string]func(interface{}, interface{}, func(interface{}, interface{})) error),
+		pluginCache:    make(map[string]MapReduceFunctions),
 	}
+}
+
+type KeyValue struct {
+	Key   string
+	Value string
+}
+
+type MapReduceFunctions struct {
+	mapFunc    func(interface{}, interface{}, func(interface{}, interface{})) error
+	reduceFunc func(interface{}, []interface{}, func(interface{}, interface{})) error
 }
 
 func (s *StorageNode) sendHeartbeat() {
@@ -129,13 +143,13 @@ func (s *StorageNode) handleClientConnection(conn net.Conn) {
 func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
 	log.Printf("Received Map job for job ID: %s on chunk ID: %s", mapJob.JobId, mapJob.ChunkId)
 
-	// Load the Map plugin
-	mapFunc, err := s.loadMapPlugin(mapJob.JobId ,mapJob.MapPlugin)
+	// Load the plugin functions
+	mapFunc, reduceFunc, err := s.loadPlugin(mapJob.JobId, mapJob.Plugin)
 	if err != nil {
-		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to load Map plugin")
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to load plugin")
 		return
 	}
-
+	
 	// Retrieve the chunk data based on chunk ID
 	chunkData, _, err := s.getChunkDataWithChecksum(mapJob.ChunkId)
 	if err != nil {
@@ -143,38 +157,71 @@ func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
 		return
 	}
 
-	// Ensure output is written to the specified StorageDir
-	outputFileName := fmt.Sprintf("%s/map_output_%s_%s.txt", s.StorageDir, mapJob.JobId, mapJob.ChunkId)
-
-	file, err := os.OpenFile(outputFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Create a temporary file for the unsorted output
+	tempFile, err := os.CreateTemp(s.StorageDir, fmt.Sprintf("map_output_%s_%s_*.txt", mapJob.JobId, mapJob.ChunkId))
 	if err != nil {
-		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to open output file")
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to create temporary output file")
 		return
 	}
-	defer file.Close()
+	defer func() {
+		tempFile.Close()
+		os.Remove(tempFile.Name()) // Ensure the temp file is removed after use
+	}()
 
-	// Define the emit function to write key-value pairs to the file
+	// Define the emit function to write key-value pairs to the temporary file
 	emit := func(key interface{}, value interface{}) {
-		// Attempt to write the key-value pair to the file
-		_, err := fmt.Fprintf(file, "%v: %v\n", key, value)
+		_, err := fmt.Fprintf(tempFile, "%v: %v\n", key, value)
 		if err != nil {
-			log.Printf("Failed to write to output file for job %s, chunk %s: %v", mapJob.JobId, mapJob.ChunkId, err)
-		} else {
-			log.Printf("Emitted key-value pair: %v -> %v", key, value)
+			log.Printf("Failed to write to temporary output file for job %s, chunk %s: %v", mapJob.JobId, mapJob.ChunkId, err)
 		}
 	}
 
+	// Process chunk data line by line using bufio.Scanner
+	scanner := bufio.NewScanner(bytes.NewReader(chunkData))
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		// Execute the Map function on each line
+		if err = mapFunc(mapJob.ChunkId, line, emit); err != nil {
+			s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Map function execution failed")
+			return
+		}
+	}
 
-	// Execute the Map function on the chunk data, passing the emit function
-	if err = mapFunc(mapJob.ChunkId, chunkData, emit); err != nil {
-		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Map function execution failed")
+	// Check for errors encountered during scanning
+	if err := scanner.Err(); err != nil {
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to read chunk line by line")
 		return
 	}
-	log.Printf("map function excuted successfully ")
+
+	// Close the temp file before sorting it
+	tempFile.Close()
+
+	// Define the output file pattern including job ID and chunk ID
+	outputFilePattern := fmt.Sprintf("%s/sorted_output_%s_%s_part_%%d.txt", s.StorageDir, mapJob.JobId, mapJob.ChunkId)
+
+	// Sort the temporary file contents and write to multiple sorted output files for reducers
+	numReducers := int(mapJob.ReducerNum)
+	err = s.externalSortFile(tempFile.Name(), outputFilePattern, numReducers)
+	if err != nil {
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to sort output file")
+		return
+	}
+
+	// Call combineSortedOutput to group the sorted data by key for each reducer partition
+	err = s.combineSortedOutput(mapJob.JobId,mapJob.ChunkId,outputFilePattern, numReducers, reduceFunc)
+	if err != nil {
+		log.Printf("Error combining sorted output for job %s, chunk %s: %v", mapJob.JobId, mapJob.ChunkId, err)
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, fmt.Sprintf("Failed to combine sorted output: %v", err))
+		return
+	}
+	
+
+	log.Printf("Map function executed and output sorted and combined successfully for job ID %s on chunk ID %s", mapJob.JobId, mapJob.ChunkId)
 
 	// Send success response to the controller
 	s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, true, "")
 }
+
 
 // Helper function to send the MapJobResponse
 func (s *StorageNode) sendMapJobResponse(conn net.Conn, jobId, chunkId string, success bool, errorMessage string) {
@@ -194,55 +241,314 @@ func (s *StorageNode) sendMapJobResponse(conn net.Conn, jobId, chunkId string, s
 	}
 }
 
-
-func (s *StorageNode) loadMapPlugin(jobId string, mapPlugin []byte) (func(interface{}, interface{}, func(interface{}, interface{})) error, error) {
+func (s *StorageNode) loadPlugin(jobId string, pluginData []byte) (mapFunc func(interface{}, interface{}, func(interface{}, interface{})) error, reduceFunc func(interface{}, []interface{}, func(interface{}, interface{})) error, err error) {
 	// Initialize the plugin cache if it's nil
 	if s.pluginCache == nil {
-		s.pluginCache = make(map[string]func(interface{}, interface{}, func(interface{}, interface{})) error)
+		s.pluginCache = make(map[string]MapReduceFunctions)
 	}
 
 	// Check if the plugin for this jobId is already loaded in cache
-	if mapFunc, exists := s.pluginCache[jobId]; exists {
-		log.Printf("Reusing cached map function for job %s", jobId)
-		return mapFunc, nil
+	if cached, exists := s.pluginCache[jobId]; exists {
+		log.Printf("Reusing cached map and reduce functions for job %s", jobId)
+		return cached.mapFunc, cached.reduceFunc, nil
 	}
 
 	// Generate a unique temporary file name for the job
-	tempFile, err := os.CreateTemp("", fmt.Sprintf("map_plugin_%s_*.so", jobId))
+	tempFile, err := os.CreateTemp("", fmt.Sprintf("plugin_%s_*.so", jobId))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %v", err)
+		return nil, nil, fmt.Errorf("failed to create temp file: %v", err)
 	}
 	defer os.Remove(tempFile.Name()) // Ensure the file is cleaned up after loading
 
 	// Write the binary data to the temporary file
-	if _, err := tempFile.Write(mapPlugin); err != nil {
-		return nil, fmt.Errorf("failed to write plugin data to file: %v", err)
+	if _, err := tempFile.Write(pluginData); err != nil {
+		return nil, nil, fmt.Errorf("failed to write plugin data to file: %v", err)
 	}
 	tempFile.Close()
 
 	// Load the plugin
 	plug, err := plugin.Open(tempFile.Name())
 	if err != nil {
-		return nil, fmt.Errorf("failed to load plugin: %v", err)
+		return nil, nil, fmt.Errorf("failed to load plugin: %v", err)
 	}
 
 	// Lookup the Map function
 	symMap, err := plug.Lookup("Map")
 	if err != nil {
-		return nil, fmt.Errorf("failed to find Map function in plugin: %v", err)
+		return nil, nil, fmt.Errorf("failed to find Map function in plugin: %v", err)
 	}
-
-	// Assert that the symbol is of the expected type
 	mapFunc, ok := symMap.(func(interface{}, interface{}, func(interface{}, interface{})) error)
 	if !ok {
-		return nil, fmt.Errorf("plugin Map function has unexpected type")
+		return nil, nil, fmt.Errorf("plugin Map function has unexpected type")
 	}
 
-	// Cache the map function for this jobId
-	s.pluginCache[jobId] = mapFunc
+	// Lookup the Reduce function with the correct signature
+	symReduce, err := plug.Lookup("Reduce")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to find Reduce function in plugin: %v", err)
+	}
+	reduceFunc, rok := symReduce.(func(interface{}, []interface{}, func(interface{}, interface{})) error)
+	if !rok {
+		return nil, nil, fmt.Errorf("plugin Reduce function has unexpected type")
+	}
 
-	log.Printf("Map function loaded and cached for job %s", jobId)
-	return mapFunc, nil
+	// Cache the map and reduce functions for this jobId
+	s.pluginCache[jobId] = MapReduceFunctions{
+		mapFunc:    mapFunc,
+		reduceFunc: reduceFunc,
+	}
+
+	log.Printf("Map and Reduce functions loaded and cached for job %s", jobId)
+	return mapFunc, reduceFunc, nil
+}
+
+
+
+func (s *StorageNode) combineSortedOutput(jobId string, chunkId string, inputFilePattern string, numReducers int, reduceFunc func(interface{}, []interface{}, func(interface{}, interface{})) error) error {
+	for i := 0; i < numReducers; i++ {
+		// Open the sorted output file for each reducer
+		inputFileName := fmt.Sprintf(inputFilePattern, i) // e.g., "sorted_output_<job_id>_<chunk_id>_part_%d.txt"
+		inputFile, err := os.Open(inputFileName)
+		if err != nil {
+			return fmt.Errorf("failed to open sorted file %s: %v", inputFileName, err)
+		}
+		defer inputFile.Close()
+
+		// Create a new file for the combined output
+		combinedFileName := fmt.Sprintf("%s/combined_output_%s_%s_part_%d.txt", s.StorageDir, jobId, chunkId, i)
+		combinedFile, err := os.Create(combinedFileName)
+		if err != nil {
+			return fmt.Errorf("failed to create combined file %s: %v", combinedFileName, err)
+		}
+		defer combinedFile.Close()
+		writer := bufio.NewWriter(combinedFile)
+
+		// Define the emit function to write the final combined output
+		emit := func(key interface{}, value interface{}) {
+			fmt.Fprintf(writer, "%v: %v\n", key, value)
+		}
+
+		// Combine consecutive entries with the same key using the reduce function
+		scanner := bufio.NewScanner(inputFile)
+		var currentKey string
+		var currentValues []interface{}
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.SplitN(line, ": ", 2)
+			if len(parts) != 2 {
+				continue // Skip malformed lines
+			}
+			key := parts[0]
+			valueStr := parts[1]
+
+			// Convert the value from string to []byte
+			valueBytes := []byte(valueStr)
+
+			// If the key changes, apply the reduce function on the previous grouping
+			if key != currentKey && currentKey != "" {
+				if err := reduceFunc(currentKey, currentValues, emit); err != nil {
+					return fmt.Errorf("reduce function failed for key %s: %v", currentKey, err)
+				}
+				currentValues = []interface{}{}
+			}
+
+			// Update the current key and append the []byte value to the list
+			currentKey = key
+			currentValues = append(currentValues, valueBytes)
+		}
+
+		// Apply the reduce function to the last grouping if there's any remaining data
+		if len(currentValues) > 0 {
+			if err := reduceFunc(currentKey, currentValues, emit); err != nil {
+				return fmt.Errorf("reduce function failed for key %s: %v", currentKey, err)
+			}
+		}
+
+		writer.Flush()
+	}
+
+	return nil
+}
+
+
+
+
+func (s *StorageNode) externalSortFile(inputFileName, outputFilePattern string, numReducers int) error {
+	// Step 1: Split and Sort the input file into sorted chunks
+	chunkFiles, err := s.splitAndSortChunks(inputFileName, 100000) // Assuming 100000 pairs per chunk
+	if err != nil {
+		return fmt.Errorf("failed to split and sort chunks: %v", err)
+	}
+
+	// Step 2: Merge the sorted chunk files into multiple output files for reducers
+	err = s.mergeSortedChunks(chunkFiles, outputFilePattern, numReducers)
+	if err != nil {
+		return fmt.Errorf("failed to merge sorted chunks: %v", err)
+	}
+
+	// Clean up temporary chunk files with error handling
+	for _, chunkFile := range chunkFiles {
+		if err := os.Remove(chunkFile); err != nil {
+			log.Printf("Failed to delete temporary chunk file %s: %v", chunkFile, err)
+		}
+	}
+
+	return nil
+}
+
+
+
+
+func (s *StorageNode) splitAndSortChunks(inputFileName string, chunkSize int) ([]string, error) {
+	file, err := os.Open(inputFileName)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var chunkFiles []string
+	scanner := bufio.NewScanner(file)
+	var kvPairs []KeyValue
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ": ", 2)
+		if len(parts) != 2 {
+			continue // Skip malformed lines
+		}
+		kvPairs = append(kvPairs, KeyValue{Key: parts[0], Value: parts[1]})
+
+		// If we reached the chunk size, sort and save to a temporary file
+		if len(kvPairs) >= chunkSize {
+			chunkFile, err := s.saveSortedChunk(kvPairs)
+			if err != nil {
+				return nil, err
+			}
+			chunkFiles = append(chunkFiles, chunkFile)
+			kvPairs = nil // Reset for the next chunk
+		}
+	}
+
+	// Write any remaining pairs in the last chunk
+	if len(kvPairs) > 0 {
+		chunkFile, err := s.saveSortedChunk(kvPairs)
+		if err != nil {
+			return nil, err
+		}
+		chunkFiles = append(chunkFiles, chunkFile)
+	}
+
+	return chunkFiles, nil
+}
+
+func (s *StorageNode) saveSortedChunk(kvPairs []KeyValue) (string, error) {
+	sort.Slice(kvPairs, func(i, j int) bool {
+		return kvPairs[i].Key < kvPairs[j].Key
+	})
+
+	tempFile, err := os.CreateTemp(s.StorageDir, "chunk_*.txt")
+	if err != nil {
+		return "", err
+	}
+	defer tempFile.Close()
+
+	writer := bufio.NewWriter(tempFile)
+	for _, kv := range kvPairs {
+		fmt.Fprintf(writer, "%s: %s\n", kv.Key, kv.Value)
+	}
+	writer.Flush()
+
+	return tempFile.Name(), nil
+}
+
+func (s *StorageNode) mergeSortedChunks(chunkFiles []string, outputFilePattern string, numReducers int) error {
+	// Create multiple output files and writers based on the number of reducers
+	writers := make([]*bufio.Writer, numReducers)
+	for i := 0; i < numReducers; i++ {
+		fileName := fmt.Sprintf(outputFilePattern, i) // e.g., "output_part_%d.txt"
+		outputFile, err := os.Create(fileName)
+		if err != nil {
+			return fmt.Errorf("failed to create output file %s: %v", fileName, err)
+		}
+		defer outputFile.Close()
+		writers[i] = bufio.NewWriter(outputFile)
+	}
+
+	// Open each chunk file and create a scanner for each
+	scanners := make([]*bufio.Scanner, len(chunkFiles))
+	currentPairs := make([]*KeyValue, len(chunkFiles))
+
+	for i, chunkFile := range chunkFiles {
+		file, err := os.Open(chunkFile)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		scanners[i] = scanner
+
+		// Initialize currentPairs with the first entry from each chunk
+		if scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.SplitN(line, ": ", 2)
+			if len(parts) == 2 {
+				currentPairs[i] = &KeyValue{Key: parts[0], Value: parts[1]}
+			}
+		}
+	}
+
+	// Perform k-way merge without a heap
+	for {
+		// Find the minimum key among the current pairs
+		minIdx := -1
+		for i, kv := range currentPairs {
+			if kv != nil && (minIdx == -1 || kv.Key < currentPairs[minIdx].Key) {
+				minIdx = i
+			}
+		}
+
+		// If all pairs are nil, we've exhausted all files
+		if minIdx == -1 {
+			break
+		}
+
+		// Determine the reducer partition for the minimum key
+		minPair := currentPairs[minIdx]
+		reducerIdx := hashKeyToReducer(minPair.Key, numReducers)
+
+		// Write the minimum key-value pair to the appropriate output file
+		fmt.Fprintf(writers[reducerIdx], "%s: %s\n", minPair.Key, minPair.Value)
+
+		// Advance the scanner for the file that had the minimum key
+		if scanners[minIdx].Scan() {
+			line := scanners[minIdx].Text()
+			parts := strings.SplitN(line, ": ", 2)
+			if len(parts) == 2 {
+				currentPairs[minIdx] = &KeyValue{Key: parts[0], Value: parts[1]}
+			}
+		} else {
+			// Mark this file as exhausted
+			currentPairs[minIdx] = nil
+		}
+	}
+
+	// Flush all writers to ensure data is written to files
+	for _, writer := range writers {
+		writer.Flush()
+	}
+
+	return nil
+}
+
+// hashKeyToReducer returns the reducer index for a given key
+func hashKeyToReducer(key string, numReducers int) int {
+	hash := 0
+	for _, char := range key {
+		hash = (hash*31 + int(char)) % numReducers
+	}
+	return hash
 }
 
 

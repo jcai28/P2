@@ -66,21 +66,20 @@ message Response {
   }
 }
 
-
 // Message for requesting a MapReduce job from client to controller
 message MapReduceJobRequest {
     string job_id = 1;
     string input_file = 2;
-    bytes map_plugin = 3;
-    bytes reduce_plugin = 4;
+    bytes plugin = 3;
+    int32 reducer_num = 4; // Number of reducers for the job
 }
 
 // Message for requesting a Map job from controller to storage node
 message MapJobRequest {
-    string job_id = 1;            // Unique identifier for the MapReduce job
-    string chunk_id = 2;          // Chunk to be processed by the Map job
-    bytes map_plugin = 3;         // Binary data of the map plugin file
-    //add redeucers info 
+    string job_id = 1;         // Unique identifier for the MapReduce job
+    string chunk_id = 2;       // Chunk to be processed by the Map job
+    bytes plugin = 3;          // Binary data of the combined MapReduce plugin file
+    int32 reducer_num = 4;    // Number of reducers for this job
 }
 
 // Response message from the storage node after processing a Map job
