@@ -8,9 +8,11 @@ import (
 	"net"
 	"sync"
 	"math/rand"
+	"crypto/sha256"
 	"time"
 	"strings"
 	"strconv"
+	"sort"
 
 	"github.com/golang/protobuf/proto"
 	pb "dfs/generated/dfspb" // Import the proto package
@@ -551,39 +553,106 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 
 	c.jobStatus[jobReq.JobId] = make(map[string]bool)
 	var wg sync.WaitGroup
+	var selectedNodes []*pb.StorageNodeInfo // Store all selected nodes
 
-	// Step 2: Send plugins and job details to one node per chunk
+	// Step 2: Select nodes for chunks
+	chunkNodeMap := make(map[string]*pb.StorageNodeInfo) // Map to record node for each chunk
+
 	for idx, chunk := range chunkAllocations {
 		if len(chunk.Nodes) == 0 {
+			log.Printf("No available nodes for chunk %d of input file %s", idx, jobReq.InputFile)
 			continue // No available nodes for this chunk, skip it
 		}
 
 		// Pick the first available node for this chunk
 		selectedNode := c.selectNodeForChunk(chunk)
+		selectedNodes = append(selectedNodes, selectedNode)
 		chunkID := fmt.Sprintf("%s_%d", jobReq.InputFile, idx)
 		c.nodeWorkload[selectedNode.NodeId]++
 		c.jobStatus[jobReq.JobId][chunkID] = false // Mark as incomplete
 
+		// Record the selected node for this chunk
+		chunkNodeMap[chunkID] = selectedNode
+	}
+
+	// Step 3: Select reducers
+	var reducerNodes []*pb.StorageNodeInfo
+	reducerNum := int(jobReq.ReducerNum)
+
+	sort.Slice(selectedNodes, func(i, j int) bool {
+		return c.nodeWorkload[selectedNodes[i].NodeId] < c.nodeWorkload[selectedNodes[j].NodeId]
+	})
+
+	for i := 0; i < reducerNum && i < len(selectedNodes); i++ {
+		reducerNodes = append(reducerNodes, selectedNodes[i])
+	}
+
+	jobPort := assignPort(jobReq.JobId)
+
+	// Step 4: Assign map jobs to mapper nodes
+	// Assign map jobs to mapper nodes based on chunkNodeMap
+	for chunkID, node := range chunkNodeMap {
 		wg.Add(1)
-		go func(node *pb.StorageNodeInfo, jobId, chunkID string) {
+		go func(node *pb.StorageNodeInfo, chunkID string) {
 			defer wg.Done()
 
-			// Send the job to the storage node
-			success := c.sendJobToStorageNode(node, jobId, jobReq.Plugin, chunkID, jobReq.ReducerNum)
-				// Update job status and node workload safely
+			// Create the MapJobRequest
+			mapJobRequest := &pb.MapJobRequest{
+				JobId:      jobReq.JobId,
+				ChunkId:    chunkID,
+				Plugin:     jobReq.Plugin,
+				ReducerNum: int32(reducerNum),
+				Port:       int32(jobPort), // Shared port for reducers
+				Reducers:   reducerNodes,  // Send reducerNodes directly
+			}
+
+			// Send the MapJobRequest to the storage node
+			success := c.sendJobToStorageNode(node, mapJobRequest)
 			c.Mutex.Lock()
 			defer c.Mutex.Unlock()
-			if (success){
-				c.jobStatus[jobId][chunkID] = true
-				c.nodeWorkload[node.NodeId]-- 
+			if success {
+				c.jobStatus[jobReq.JobId][chunkID] = true // Track mapper status
+			} else {
+				log.Printf("Mapper job failed for chunk %s on node %s", chunkID, node.NodeId)
 			}
-		}(selectedNode, jobReq.JobId, chunkID)
+			c.nodeWorkload[node.NodeId]--
+		}(node, chunkID)
+	}
+
+
+	// Step 5: Assign reduce jobs to reducer nodes (all reducers use the same jobPort)
+	for i, node := range reducerNodes {
+		reducerID := fmt.Sprintf("%s_reducer_%d", jobReq.JobId, i)
+
+		reduceJobRequest := &pb.ReduceJobRequest{
+			JobId:      jobReq.JobId,
+			ReducerId:  reducerID,
+			Port:       int32(jobPort), // Shared port for reducers
+			MapperNum:  int32(len(selectedNodes)),
+			Plugin:     jobReq.Plugin,
+		}
+
+		wg.Add(1)
+		go func(node *pb.StorageNodeInfo, request *pb.ReduceJobRequest) {
+			defer wg.Done()
+
+			// Send the ReduceJobRequest to the storage node
+			success := c.sendReducerJobToNode(node, request)
+			c.Mutex.Lock()
+			defer c.Mutex.Unlock()
+			if success {
+				c.jobStatus[jobReq.JobId][reducerID] = true // Track reducer status
+			} else {
+				log.Printf("Reducer job failed for reducer %s on node %s", reducerID, node.NodeId)
+			}
+			c.nodeWorkload[node.NodeId]--
+		}(node, reduceJobRequest)
 	}
 
 	// Wait for all goroutines to complete
 	wg.Wait()
 
-	// Step 4: Check if all chunks are complete
+	// Step 6: Check if all jobs are complete
 	allComplete := true
 	for _, complete := range c.jobStatus[jobReq.JobId] {
 		if !complete {
@@ -592,7 +661,7 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 		}
 	}
 
-	// Respond to the client based on job completion status
+	// Respond to the client based on completion status
 	if allComplete {
 		log.Printf("MapReduce job %s completed successfully", jobReq.JobId)
 		c.sendResponse(conn, &pb.Response{
@@ -612,16 +681,29 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 				MapReduceJob: &pb.MapReduceJobResponse{
 					JobId:        jobReq.JobId,
 					Success:      false,
-					ErrorMessage: "One or more chunks failed",
+					ErrorMessage: "One or more jobs failed",
 				},
 			},
 		})
 	}
 
-	// Clean up job status after completion
+
+	// Clean up job status
 	delete(c.jobStatus, jobReq.JobId)
 }
 
+func assignPort(jobId string) int {
+	minPort := 49152
+	maxPort := 65535
+	portRange := maxPort - minPort + 1
+
+	// Hash the JobId to get a deterministic value
+	hash := sha256.Sum256([]byte(jobId))
+	hashValue := int(hash[0])<<24 | int(hash[1])<<16 | int(hash[2])<<8 | int(hash[3])
+
+	// Map hash to a port in the range
+	return minPort + (hashValue % portRange)
+}
 
 func (c *Controller) selectNodeForChunk(chunk *pb.ChunkAllocation) *pb.StorageNodeInfo {
 	var selectedNode *pb.StorageNodeInfo
@@ -645,13 +727,7 @@ func (c *Controller) selectNodeForChunk(chunk *pb.ChunkAllocation) *pb.StorageNo
 }
 
 
-func (c *Controller) sendJobToStorageNode(
-	node *pb.StorageNodeInfo,
-	jobId string,
-	plugin []byte,
-	chunkID string,
-	reducerNum int32,
-) bool {
+func (c *Controller) sendJobToStorageNode(node *pb.StorageNodeInfo, mapJobRequest *pb.MapJobRequest) bool {
 	// Connect to the storage node
 	conn, err := net.Dial("tcp", node.Address)
 	if err != nil {
@@ -660,25 +736,20 @@ func (c *Controller) sendJobToStorageNode(
 	}
 	defer conn.Close()
 
-	// Create the MapJobRequest with the updated fields
-	mapJobRequest := &pb.Request{
+	// Wrap the MapJobRequest in a pb.Request
+	request := &pb.Request{
 		Type: pb.RequestType_MAP_JOB,
 		Request: &pb.Request_MapJob{
-			MapJob: &pb.MapJobRequest{
-				JobId:      jobId,
-				ChunkId:    chunkID,
-				Plugin:     plugin,        // Combined plugin containing both Map and Reduce functions
-				ReducerNum: reducerNum,   // Number of reducers for the job
-			},
+			MapJob: mapJobRequest,
 		},
 	}
 
 	// Send the MapJobRequest to the storage node
-	if err := c.sendRequest(conn, mapJobRequest); err != nil {
+	if err := c.sendRequest(conn, request); err != nil {
 		log.Printf("Failed to send MapJobRequest to node %s: %v", node.NodeId, err)
 		return false
 	}
-	log.Printf("Sent Map job request for job %s to storage node %s", jobId, node.NodeId)
+	log.Printf("Sent Map job request for job %s to storage node %s", mapJobRequest.JobId, node.NodeId)
 
 	// Wait for the MapJobResponse from the storage node
 	response, err := c.readResponse(conn)
@@ -692,14 +763,56 @@ func (c *Controller) sendJobToStorageNode(
 
 	// Check the response status and update the job status accordingly
 	if mapJobResponse.Success {
-		log.Printf("Map job %s for chunk %s completed successfully on node %s", jobId, chunkID, node.NodeId)
+		log.Printf("Map job %s for chunk %s completed successfully on node %s", mapJobRequest.JobId, mapJobRequest.ChunkId, node.NodeId)
 		return true
 	} else {
-		log.Printf("Map job %s for chunk %s failed on node %s: %s", jobId, chunkID, node.NodeId, mapJobResponse.ErrorMessage)
+		log.Printf("Map job %s for chunk %s failed on node %s: %s", mapJobRequest.JobId, mapJobRequest.ChunkId, node.NodeId, mapJobResponse.ErrorMessage)
 		return false
 	}
 }
 
+
+func (c *Controller) sendReducerJobToNode(node *pb.StorageNodeInfo, reduceJobRequest *pb.ReduceJobRequest) bool {
+	// Establish a connection to the node
+	conn, err := net.Dial("tcp", node.Address)
+	if err != nil {
+		log.Printf("Failed to connect to node %s for reduce job: %v", node.NodeId, err)
+		return false
+	}
+	defer conn.Close()
+
+	// Wrap the ReduceJobRequest in a pb.Request
+	request := &pb.Request{
+		Type: pb.RequestType_REDUCE_JOB,
+		Request: &pb.Request_ReduceJob{
+			ReduceJob: reduceJobRequest,
+		},
+	}
+
+	// Send the ReduceJobRequest to the storage node
+	if err := c.sendRequest(conn, request); err != nil {
+		log.Printf("Failed to send ReduceJobRequest to node %s: %v", node.NodeId, err)
+		return false
+	}
+	log.Printf("Sent Reduce job request for job %s to storage node %s", reduceJobRequest.JobId, node.NodeId)
+
+	// Wait for the ReduceJobResponse from the storage node
+	response, err := c.readResponse(conn)
+	if err != nil {
+		log.Printf("Failed to receive response from node %s: %v", node.NodeId, err)
+		return false
+	}
+
+	// Process the ReduceJobResponse
+	reduceResponse := response.GetReduceJob()
+	if !reduceResponse.Success {
+		log.Printf("Reducer job %s failed on node %s: %s", reduceResponse.ReducerId, node.NodeId, reduceResponse.ErrorMessage)
+		return false
+	}
+
+	log.Printf("Reducer job %s succeeded on node %s", reduceResponse.ReducerId, node.NodeId)
+	return true
+}
 
 
 // Handle file deletion request

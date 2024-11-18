@@ -29,6 +29,7 @@ type StorageNode struct {
 	Port           string
 	Conn           net.Conn
 	Mutex          sync.Mutex
+	pluginMutex    sync.Mutex
 	TotalRequests  int64
 	pluginCache    map[string]MapReduceFunctions
 }
@@ -135,9 +136,222 @@ func (s *StorageNode) handleClientConnection(conn net.Conn) {
 		s.handleAddReplica(req.GetAddReplica(), conn)
 	case dfspb.RequestType_MAP_JOB: // Handle the Map job request
 		s.handleMapJob(req.GetMapJob(), conn)
+	case dfspb.RequestType_REDUCE_JOB: // Handle the Map job request
+		s.handleReduceJob(req.GetReduceJob(), conn)
 	default:
 		log.Printf("Unknown request type from client")
 	}
+}
+
+func (s *StorageNode) handleReduceJob(request *dfspb.ReduceJobRequest, conn net.Conn) {
+	// Validate the ReduceJobRequest
+	if request == nil || request.JobId == "" || len(request.Plugin) == 0 || request.ReducerId == "" {
+		log.Printf("Invalid ReduceJobRequest received")
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:        request.JobId,
+					ReducerId:    request.ReducerId,
+					Success:      false,
+					ErrorMessage: "Invalid ReduceJobRequest",
+				},
+			},
+		})
+		return
+	}
+
+	log.Printf("Processing reduce job: %s on port %d", request.ReducerId, request.Port)
+
+	// Step 1: Initialize the Reduce Function from the Plugin
+	_, reduceFunc, err := s.loadPlugin(request.JobId, request.Plugin)
+	if err != nil {
+		log.Printf("Failed to load reduce plugin for job %s: %v", request.JobId, err)
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:        request.JobId,
+					ReducerId:    request.ReducerId,
+					Success:      false,
+					ErrorMessage: "Failed to load reduce plugin",
+				},
+			},
+		})
+		return
+	}
+
+	// Step 2: Start Listening for Mapper Files
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", request.Port))
+	if err != nil {
+		log.Printf("Failed to listen on port %d: %v", request.Port, err)
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:        request.JobId,
+					ReducerId:    request.ReducerId,
+					Success:      false,
+					ErrorMessage: "Failed to listen on port",
+				},
+			},
+		})
+		return
+	}
+	defer listener.Close()
+
+	log.Printf("Listening for mapper files on port %d", request.Port)
+
+	// Create the temp file for appending all mapper outputs
+	tempFilePath := fmt.Sprintf("%s/temp_output_%s.txt", s.StorageDir, request.JobId)
+	tempFile, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("Failed to create temp file for mapper outputs: %v", err)
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:        request.JobId,
+					ReducerId:    request.ReducerId,
+					Success:      false,
+					ErrorMessage: "Failed to create temp file",
+				},
+			},
+		})
+		return
+	}
+	defer tempFile.Close()
+
+	// Collect mapper files
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < int(request.MapperNum); i++ {
+		clientConn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Failed to accept connection: %v", err)
+			continue
+		}
+
+		wg.Add(1)
+		go func(clientConn net.Conn) {
+			defer clientConn.Close()
+			defer wg.Done()
+
+			// Read message length prefix
+			var messageLength int32
+			err := binary.Read(clientConn, binary.LittleEndian, &messageLength)
+			if err != nil {
+				log.Printf("Failed to read message length: %v", err)
+				return
+			}
+
+			// Read the serialized message
+			messageData := make([]byte, messageLength)
+			_, err = io.ReadFull(clientConn, messageData)
+			if err != nil {
+				log.Printf("Failed to read mapper message: %v", err)
+				return
+			}
+
+			// Unmarshal the message
+			var mapperFile dfspb.MapperFile
+			err = proto.Unmarshal(messageData, &mapperFile)
+			if err != nil {
+				log.Printf("Failed to parse mapper message: %v", err)
+				return
+			}
+
+			// Determine the source of the content
+			var content []byte
+			if mapperFile.Content == nil {
+				// Read content from the specified file
+				content, err = os.ReadFile(mapperFile.FileName)
+				if err != nil {
+					log.Printf("Failed to read file from local path %s: %v", mapperFile.FileName, err)
+					return
+				}
+				log.Printf("Read content from local file: %s", mapperFile.FileName)
+			} else {
+				// Use the content provided in the message
+				content = mapperFile.Content
+				log.Printf("Received content for chunk: %s", mapperFile.ChunkId)
+			}
+
+			// Append the file content to the temp file
+			mu.Lock()
+			defer mu.Unlock()
+			_, err = tempFile.Write(content)
+			if err != nil {
+				log.Printf("Failed to append content to temp file: %v", err)
+				return
+			}
+
+			log.Printf("Appended content from mapper file: %s (chunk: %s)", mapperFile.FileName, mapperFile.ChunkId)
+		}(clientConn)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	log.Printf("All mapper files received and appended for job %s", request.JobId)
+
+	// Step 3: Sort and Combine Outputs Using Existing Methods
+	outputFilePattern := fmt.Sprintf("%s/sorted_reducer_output_%s_part_%%d.txt", s.StorageDir, request.JobId)
+
+	numReducers := 1 // Adjust if multiple reducers are needed
+
+	// Perform external sorting
+	err = s.externalSortFile(tempFilePath, outputFilePattern, numReducers)
+	if err != nil {
+		log.Printf("Failed to sort mapper outputs for job %s: %v", request.JobId, err)
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:        request.JobId,
+					ReducerId:    request.ReducerId,
+					Success:      false,
+					ErrorMessage: "Failed to sort mapper outputs",
+				},
+			},
+		})
+		return
+	}
+
+	// Combine sorted outputs and apply the reduce function
+	combinedFilePattern := fmt.Sprintf("%s/combined_reducer_output_%s_part_%%d.txt", s.StorageDir, request.JobId)
+	err = s.combineSortedOutput(request.JobId, request.ReducerId, outputFilePattern, numReducers, combinedFilePattern, reduceFunc)
+	if err != nil {
+		log.Printf("Error combining sorted output for job %s: %v", request.JobId, err)
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:        request.JobId,
+					ReducerId:    request.ReducerId,
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("Failed to combine sorted output: %v", err),
+				},
+			},
+		})
+		return
+	}
+
+	log.Printf("Reduce job %s completed successfully.", request.ReducerId)
+
+	// Step 4: Send Success Response to the Controller
+	s.sendResponse(conn, &dfspb.Response{
+		Type: dfspb.RequestType_REDUCE_JOB,
+		Response: &dfspb.Response_ReduceJob{
+			ReduceJob: &dfspb.ReduceJobResponse{
+				JobId:        request.JobId,
+				ReducerId:    request.ReducerId,
+				Success:      true,
+				ErrorMessage: "",
+			},
+		},
+	})
 }
 
 func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
@@ -146,16 +360,23 @@ func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
 	// Load the plugin functions
 	mapFunc, reduceFunc, err := s.loadPlugin(mapJob.JobId, mapJob.Plugin)
 	if err != nil {
-		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to load plugin")
+		errorMessage := fmt.Sprintf("Failed to load plugin: %v", err)
+		log.Printf(errorMessage) // Log the error for debugging
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, errorMessage)
 		return
 	}
 	
 	// Retrieve the chunk data based on chunk ID
 	chunkData, _, err := s.getChunkDataWithChecksum(mapJob.ChunkId)
 	if err != nil {
-		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, "Failed to retrieve chunk data")
+		// Log the specific error for debugging purposes
+		log.Printf("Failed to retrieve chunk data for chunk ID %s: %v", mapJob.ChunkId, err)
+	
+		// Include the error message in the response to provide more context
+		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, fmt.Sprintf("Failed to retrieve chunk data: %v", err))
 		return
 	}
+	
 
 	// Create a temporary file for the unsorted output
 	tempFile, err := os.CreateTemp(s.StorageDir, fmt.Sprintf("map_output_%s_%s_*.txt", mapJob.JobId, mapJob.ChunkId))
@@ -207,20 +428,104 @@ func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
 		return
 	}
 
+	combinedFilePattern := fmt.Sprintf("%s/combined_output_%s_%s_part_%%d.txt", s.StorageDir, mapJob.JobId, mapJob.ChunkId)
+
 	// Call combineSortedOutput to group the sorted data by key for each reducer partition
-	err = s.combineSortedOutput(mapJob.JobId,mapJob.ChunkId,outputFilePattern, numReducers, reduceFunc)
+	err = s.combineSortedOutput(mapJob.JobId,mapJob.ChunkId,outputFilePattern, numReducers, combinedFilePattern, reduceFunc)
 	if err != nil {
 		log.Printf("Error combining sorted output for job %s, chunk %s: %v", mapJob.JobId, mapJob.ChunkId, err)
 		s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, fmt.Sprintf("Failed to combine sorted output: %v", err))
 		return
 	}
-	
+	// Send the combined output files to the reducers
+	for i, reducer := range mapJob.Reducers {
+		reducerFile := fmt.Sprintf(combinedFilePattern, i)
+		err := s.sendToReducer(reducerFile, reducer.Address, mapJob.Port, mapJob.ChunkId)
+		if err != nil {
+			log.Printf("Failed to send file to reducer %s on port %d: %v", reducer.Address, mapJob.Port, err)
+			s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, fmt.Sprintf("Failed to send to reducer %d: %v", i, err))
+			return
+		}
+	}
 
-	log.Printf("Map function executed and output sorted and combined successfully for job ID %s on chunk ID %s", mapJob.JobId, mapJob.ChunkId)
+	log.Printf("Map function executed, output sorted, combined, and sent to reducers successfully for job ID %s on chunk ID %s", mapJob.JobId, mapJob.ChunkId)
 
-	// Send success response to the controller
+	// Send success response
 	s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, true, "")
 }
+
+// Helper to send output files to reducers
+func (s *StorageNode) sendToReducer(filePath, address string, port int32, chunkID string) error {
+	// Extract the base address without the port
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address // If no port exists, treat as host
+	}
+
+	// Check if the host is the local machine
+	localIP := getLocalIP()
+	isLocal := (host == localIP )
+	newAddress := fmt.Sprintf("%s:%d", host, port)
+
+	// Establish a connection with a timeout
+	conn, err := net.DialTimeout("tcp", newAddress, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to connect to reducer at %s: %v", newAddress, err)
+	}
+	defer conn.Close()
+
+	// Prepare the MapperFile message
+	mapperFile := &dfspb.MapperFile{
+		FileName: filePath,
+		ChunkId:  chunkID,
+		Content:  nil, // Content is nil because the file will be accessed locally
+	}
+
+	// If the host is not local, include the file content in the message
+	if !isLocal {
+		file, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open file %s: %v", filePath, err)
+		}
+		defer file.Close()
+
+		// Read the file contents
+		content, err := io.ReadAll(file)
+		if err != nil {
+			return fmt.Errorf("failed to read file %s: %v", filePath, err)
+		}
+		mapperFile.Content = content
+	}
+
+	// Serialize the message to Protobuf
+	messageData, err := proto.Marshal(mapperFile)
+	if err != nil {
+		return fmt.Errorf("failed to marshal MapperFile: %v", err)
+	}
+
+	// Send message length first
+	messageLength := int32(len(messageData))
+	err = binary.Write(conn, binary.LittleEndian, messageLength)
+	if err != nil {
+		return fmt.Errorf("failed to send message length: %v", err)
+	}
+
+	// Send the serialized message
+	_, err = conn.Write(messageData)
+	if err != nil {
+		return fmt.Errorf("failed to send MapperFile to reducer at %s: %v", newAddress, err)
+	}
+
+	if isLocal {
+		log.Printf("Reducer is local, sent instruction to access file: %s locally", filePath)
+	} else {
+		log.Printf("Successfully sent MapperFile (size: %d bytes) to reducer at %s", len(messageData), newAddress)
+	}
+	return nil
+}
+
+
+
 
 
 // Helper function to send the MapJobResponse
@@ -246,10 +551,16 @@ func (s *StorageNode) loadPlugin(jobId string, pluginData []byte) (mapFunc func(
 	if s.pluginCache == nil {
 		s.pluginCache = make(map[string]MapReduceFunctions)
 	}
+	if s.pluginMutex == nil {
+		s.pluginMutex = &sync.Mutex{}
+	}
+	
+	s.pluginMutex.Lock()
+	defer s.pluginMutex.Unlock()
 
 	// Check if the plugin for this jobId is already loaded in cache
 	if cached, exists := s.pluginCache[jobId]; exists {
-		log.Printf("Reusing cached map and reduce functions for job %s", jobId)
+		log.Printf("%s, Reusing cached map and reduce functions for job %s", s.NodeID, jobId)
 		return cached.mapFunc, cached.reduceFunc, nil
 	}
 
@@ -269,7 +580,7 @@ func (s *StorageNode) loadPlugin(jobId string, pluginData []byte) (mapFunc func(
 	// Load the plugin
 	plug, err := plugin.Open(tempFile.Name())
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load plugin: %v", err)
+		return nil, nil, fmt.Errorf("%s: failed to load plugin: %v", s.NodeID, err)
 	}
 
 	// Lookup the Map function
@@ -298,13 +609,20 @@ func (s *StorageNode) loadPlugin(jobId string, pluginData []byte) (mapFunc func(
 		reduceFunc: reduceFunc,
 	}
 
-	log.Printf("Map and Reduce functions loaded and cached for job %s", jobId)
+	log.Printf("%s:Map and Reduce functions loaded and cached for job %s", s.NodeID, jobId)
 	return mapFunc, reduceFunc, nil
 }
 
 
 
-func (s *StorageNode) combineSortedOutput(jobId string, chunkId string, inputFilePattern string, numReducers int, reduceFunc func(interface{}, []interface{}, func(interface{}, interface{})) error) error {
+func (s *StorageNode) combineSortedOutput(
+	jobId string,
+	chunkId string,
+	inputFilePattern string,
+	numReducers int,
+	combinedFilePattern string,
+	reduceFunc func(interface{}, []interface{}, func(interface{}, interface{})) error,
+) error {
 	for i := 0; i < numReducers; i++ {
 		// Open the sorted output file for each reducer
 		inputFileName := fmt.Sprintf(inputFilePattern, i) // e.g., "sorted_output_<job_id>_<chunk_id>_part_%d.txt"
@@ -314,8 +632,10 @@ func (s *StorageNode) combineSortedOutput(jobId string, chunkId string, inputFil
 		}
 		defer inputFile.Close()
 
+		// Generate the combined filename using the passed function
+		combinedFileName := fmt.Sprintf(combinedFilePattern, i)
+
 		// Create a new file for the combined output
-		combinedFileName := fmt.Sprintf("%s/combined_output_%s_%s_part_%d.txt", s.StorageDir, jobId, chunkId, i)
 		combinedFile, err := os.Create(combinedFileName)
 		if err != nil {
 			return fmt.Errorf("failed to create combined file %s: %v", combinedFileName, err)

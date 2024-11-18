@@ -656,7 +656,7 @@ func main() {
 	switch strings.ToLower(action) {
 	case "put":
 		filename := os.Args[2]
-		chunkSize := 30// Default chunk size is 10 MB
+		chunkSize := 100// Default chunk size is 10 MB
 		if len(os.Args) == 4 {
 			size, err := strconv.Atoi(os.Args[3])
 			if err != nil || size <= 0 {

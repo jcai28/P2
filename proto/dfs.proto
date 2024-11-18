@@ -76,10 +76,12 @@ message MapReduceJobRequest {
 
 // Message for requesting a Map job from controller to storage node
 message MapJobRequest {
-    string job_id = 1;         // Unique identifier for the MapReduce job
-    string chunk_id = 2;       // Chunk to be processed by the Map job
-    bytes plugin = 3;          // Binary data of the combined MapReduce plugin file
-    int32 reducer_num = 4;    // Number of reducers for this job
+    string job_id = 1;                // Unique identifier for the MapReduce job
+    string chunk_id = 2;              // Chunk to be processed by the Map job
+    bytes plugin = 3;                 // Binary data of the combined MapReduce plugin file
+    int32 reducer_num = 4;            // Number of reducers for this job
+    int32 port = 5;                   // The port for mapper-reducer connection
+    repeated StorageNodeInfo reducers = 6; // List of reducers for this job
 }
 
 // Response message from the storage node after processing a Map job
@@ -92,19 +94,19 @@ message MapJobResponse {
 
 // Message for requesting a Reduce job from controller to storage node
 message ReduceJobRequest {
-    string job_id = 1;             // Unique identifier for the MapReduce job
-    string key = 2;                // Key for which to apply the Reduce function
-    repeated bytes values = 3;     // Values associated with this key, grouped from Map output
-    bytes reduce_plugin = 4;       // Binary data of the reduce plugin file
+    string job_id = 1;        // Unique identifier for the MapReduce job
+    string reducer_id = 2;
+    int32   port = 3;            // The port this for mapper reducer connection
+    int32  mapper_num = 4;     // Values associated with this key, grouped from Map output
+    bytes   plugin = 5;       // Binary data of the reduce plugin file
 }
 
 // Response message from the storage node after processing a Reduce job
 message ReduceJobResponse {
     string job_id = 1;             // Unique identifier for the MapReduce job
-    string key = 2;                // Key that was reduced
+    string reducer_id = 2;          
     bool success = 3;              // Indicates if the Reduce job was successful
-    string result = 4;             // Result of the Reduce job for this key
-    string error_message = 5;      // Error message, if any
+    string error_message = 4;      // Error message, if any
 }
 
 // Response message for MapReduce job request
@@ -242,4 +244,10 @@ message AddReplicaRequest {
 message AddReplicaResponse {
   bool success = 1;                     // Indicates if the replica creation was successful
   string error_message = 2;             // Optional error message
+}
+
+message MapperFile {
+    string file_name = 1;  // Name of the file
+    string chunk_id = 2;   // Chunk ID for traceability
+    bytes content = 3;     // File content as raw bytes
 }
