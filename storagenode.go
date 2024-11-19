@@ -340,18 +340,286 @@ func (s *StorageNode) handleReduceJob(request *dfspb.ReduceJobRequest, conn net.
 
 	log.Printf("Reduce job %s completed successfully.", request.ReducerId)
 
+	// Generate the combined filename
+	combinedFileName := fmt.Sprintf(combinedFilePattern, 0)
+	
+	var errorChannel = make(chan error, 1) 
+
+	// Add to WaitGroup before starting the goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done() // Mark this goroutine as done
+
+		// Attempt to store the file in DFS
+		err := s.storeInDFS(combinedFileName, 200*1024*1024)
+		if err != nil {
+			// Send error to the error channel
+			errorChannel <- err
+		}
+	}()
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	// Check for errors
+	select {
+	case err := <-errorChannel:
+		// Handle error from storeInDFS
+		log.Printf("Error storing file in DFS: %v", err)
+		s.sendResponse(conn, &dfspb.Response{
+			Type: dfspb.RequestType_REDUCE_JOB,
+			Response: &dfspb.Response_ReduceJob{
+				ReduceJob: &dfspb.ReduceJobResponse{
+					JobId:          request.JobId,
+					ReducerId:      request.ReducerId,
+					Success:        false,
+					ResultFilename: combinedFileName,
+					ErrorMessage:   err.Error(),
+				},
+			},
+		})
+		return
+	default:
+		// No errors, continue
+		log.Printf("File %s stored successfully in DFS.", combinedFileName)
+	}
+
 	// Step 4: Send Success Response to the Controller
 	s.sendResponse(conn, &dfspb.Response{
 		Type: dfspb.RequestType_REDUCE_JOB,
 		Response: &dfspb.Response_ReduceJob{
 			ReduceJob: &dfspb.ReduceJobResponse{
-				JobId:        request.JobId,
-				ReducerId:    request.ReducerId,
-				Success:      true,
-				ErrorMessage: "",
+				JobId:          request.JobId,
+				ReducerId:      request.ReducerId,
+				Success:        true,
+				ResultFilename: combinedFileName,
+				ErrorMessage:   "",
 			},
 		},
 	})
+}
+
+// Handle file upload
+func (s *StorageNode) storeInDFS(filename string, chunkSize int) error {
+	// Open the file
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Printf("Failed to open file: %v", err)
+		return err
+	}
+	defer file.Close()
+
+	// Request storage allocation from the controller
+	conn, err := net.Dial("tcp", s.ControllerAddr)
+	if err != nil {
+		log.Printf("Failed to connect to controller: %v", err)
+		return err
+	}
+	defer conn.Close()
+
+	// Get file information
+	fileInfo, err := file.Stat()
+	if err != nil {
+		log.Printf("Failed to get file info: %v", err)
+		return err
+	}
+
+	// Check if the file is a directory
+	if fileInfo.IsDir() {
+		err := fmt.Errorf("cannot store directories")
+		log.Printf("%v", err)
+		return err
+	}
+
+	// Calculate the estimated number of chunks
+	estimatedChunks := (fileInfo.Size() / int64(chunkSize)) + 1
+
+	// Send ALLOCATE_STORAGE request
+	allocateReq := &dfspb.Request{
+		Type: dfspb.RequestType_ALLOCATE_STORAGE,
+		Request: &dfspb.Request_AllocateStorage{
+			AllocateStorage: &dfspb.AllocateStorageRequest{
+				Filename: fileInfo.Name(),
+				FileSize: fileInfo.Size(),
+				ChunkNum: estimatedChunks,
+			},
+		},
+	}
+
+	if err := s.sendRequest(conn, allocateReq); err != nil {
+		log.Printf("Failed to send allocate storage request: %v", err)
+		return err
+	}
+	log.Printf("Allocation request sent: %v", allocateReq.String())
+
+	// Handle allocation response
+	resp, err := s.readResponse(conn)
+	if err != nil {
+		log.Printf("Failed to read allocation response: %v", err)
+		return err
+	}
+
+	allocations := resp.GetAllocateStorage().ChunkAllocations
+	if allocations == nil {
+		err := fmt.Errorf("failed to allocate storage: %v", resp.GetAllocateStorage().ErrorMessage)
+		log.Printf("%v", err)
+		return err
+	}
+
+	// Determine if file is text-based for line-based chunking
+	isTextFile := s.isTextFile(file)
+	chunksNum, err := s.chunkFile(file, fileInfo.Name(), chunkSize, isTextFile, allocations)
+	if err != nil {
+		log.Printf("Failed to chunk file: %v", err)
+		return err
+	}
+	log.Printf("%d chunks stored successfully", chunksNum)
+
+	// Create the ActualChunkRequest message
+	actualChunkRequest := &dfspb.Request{
+		Type: dfspb.RequestType_ACTUAL_CHUNK,
+		Request: &dfspb.Request_ActualChunk{
+			ActualChunk: &dfspb.ActualChunkRequest{
+				Filename:     fileInfo.Name(),
+				ActualChunks: int32(chunksNum),
+			},
+		},
+	}
+
+	conn, err = net.Dial("tcp", s.ControllerAddr)
+	if err != nil {
+		log.Printf("Failed to connect to controller: %v", err)
+		return err
+	}
+	defer conn.Close()
+
+	// Send the ActualChunkRequest
+	if err := s.sendRequest(conn, actualChunkRequest); err != nil {
+		log.Printf("Failed to send ActualChunkRequest: %v", err)
+		return err
+	}
+
+	log.Printf("ActualChunkRequest sent for file %s with %d chunks", fileInfo.Name(), chunksNum)
+	return nil
+}
+
+
+func (s *StorageNode) isTextFile(file *os.File) bool {
+	// Get the file name to check its extension
+	fileName := file.Name()
+	
+	// Define a list of extensions that are considered text files
+	textExtensions := []string{".txt", ".csv"}
+	
+	// Check if the file name ends with any of the text extensions
+	for _, ext := range textExtensions {
+		if strings.HasSuffix(strings.ToLower(fileName), ext) {
+			return true
+		}
+	}
+	
+	return false // Return false if the extension doesn't match any text types
+}
+
+func (s *StorageNode) chunkFile(file *os.File, fileName string, chunkSize int, isTextFile bool, allocations []*dfspb.ChunkAllocation) (int, error) {
+    // Create a buffered reader
+    reader := bufio.NewReaderSize(file, chunkSize)
+    buffer := make([]byte, chunkSize)
+    chunksUsed := 0
+
+    for i := 0; i < len(allocations); i++ {
+        n, err := io.ReadFull(reader, buffer)
+        if n > 0 {
+            chunk := buffer[:n]
+
+            // Handle text-based files: ensure chunk ends with a newline
+            if isTextFile && chunk[len(chunk)-1] != '\n' {
+                lineEnd, err := reader.ReadBytes('\n')
+                if len(lineEnd) > 0 {
+                    chunk = append(chunk, lineEnd...)
+                }
+                if err != nil && err != io.EOF {
+                    return chunksUsed, fmt.Errorf("error reading line end for chunk %d: %w", i, err)
+                }
+            }
+
+            // Store the chunk
+            if err := s.storeChunk(allocations, i, chunk, fileName); err != nil {
+                return chunksUsed, fmt.Errorf("failed to store chunk %d: %w", i, err)
+            }
+
+            chunksUsed++ // Increment the counter for every successfully processed chunk
+        }
+
+        // Handle end of file or unexpected EOF
+        if err == io.EOF || err == io.ErrUnexpectedEOF {
+            break
+        }
+        if err != nil {
+            return chunksUsed, fmt.Errorf("error reading chunk %d: %w", i, err)
+        }
+    }
+
+    return chunksUsed, nil
+}
+
+
+
+func (s *StorageNode) storeChunk(allocations []*dfspb.ChunkAllocation, index int, chunk []byte, fileName string) error {
+    // Ensure the allocation exists for the given chunk index
+    if index >= len(allocations) {
+        return fmt.Errorf("chunk allocation missing for chunk %d", index)
+    }
+
+    alloc := allocations[index]
+
+    // Ensure at least one storage node is allocated for this chunk
+    if len(alloc.Nodes) == 0 {
+        return fmt.Errorf("no storage node allocated for chunk %d", index)
+    }
+
+    // Calculate the checksum for the chunk
+    checksum := s.calculateChecksum(chunk)
+
+    // Connect to the primary storage node
+    storageAddr := alloc.Nodes[0].Address
+    storageConn, err := net.Dial("tcp", storageAddr)
+    if err != nil {
+        return fmt.Errorf("failed to connect to storage node %s: %w", storageAddr, err)
+    }
+    defer storageConn.Close()
+
+    // Prepare the store chunk request
+    storeReq := &dfspb.Request{
+        Type: dfspb.RequestType_STORE_CHUNK,
+        Request: &dfspb.Request_StoreChunk{
+            StoreChunk: &dfspb.StoreChunkRequest{
+                ChunkId:  fmt.Sprintf("%s_%d", fileName, index),
+                Data:     chunk,
+                Checksum: checksum,
+                Nodes:    alloc.Nodes[1:], // Remaining nodes for replication
+            },
+        },
+    }
+
+    // Send the store chunk request
+    if err := s.sendRequest(storageConn, storeReq); err != nil {
+        return fmt.Errorf("failed to send store chunk request for chunk %d: %w", index, err)
+    }
+
+    // Read the response from the storage node
+    storeResp, err := s.readResponse(storageConn)
+    if err != nil {
+        return fmt.Errorf("failed to read response from storage node for chunk %d: %w", index, err)
+    }
+
+    // Check if the storage was successful
+    if !storeResp.GetStoreChunk().Success {
+        return fmt.Errorf("failed to store chunk %d: %v", index, storeResp.GetStoreChunk().ErrorMessage)
+    }
+
+    log.Printf("Stored chunk %d successfully", index)
+    return nil
 }
 
 func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
@@ -440,9 +708,9 @@ func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
 	// Send the combined output files to the reducers
 	for i, reducer := range mapJob.Reducers {
 		reducerFile := fmt.Sprintf(combinedFilePattern, i)
-		err := s.sendToReducer(reducerFile, reducer.Address, mapJob.Port, mapJob.ChunkId)
+		err := s.sendToReducer(reducerFile, reducer.Address, reducer.Port, mapJob.ChunkId)
 		if err != nil {
-			log.Printf("Failed to send file to reducer %s on port %d: %v", reducer.Address, mapJob.Port, err)
+			log.Printf("Failed to send file to reducer %s on port %d: %v", reducer.Address, reducer.Port, err)
 			s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, fmt.Sprintf("Failed to send to reducer %d: %v", i, err))
 			return
 		}
@@ -461,14 +729,14 @@ func (s *StorageNode) sendToReducer(filePath, address string, port int32, chunkI
 	if err != nil {
 		host = address // If no port exists, treat as host
 	}
-
+	log.Printf("the port is %d", port)
 	// Check if the host is the local machine
 	localIP := getLocalIP()
 	isLocal := (host == localIP )
 	newAddress := fmt.Sprintf("%s:%d", host, port)
 
 	// Establish a connection with a timeout
-	conn, err := net.DialTimeout("tcp", newAddress, 10*time.Second)
+	conn, err := connectWithRetry(newAddress, 5, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to reducer at %s: %v", newAddress, err)
 	}
@@ -525,7 +793,26 @@ func (s *StorageNode) sendToReducer(filePath, address string, port int32, chunkI
 }
 
 
+func connectWithRetry(address string, maxRetries int, retryDelay time.Duration) (net.Conn, error) {
+	var conn net.Conn
+	var err error
 
+	for i := 0; i < maxRetries; i++ {
+		conn, err = net.DialTimeout("tcp", address, 10*time.Second)
+		if err == nil {
+			// Connection successful
+			return conn, nil
+		}
+
+		log.Printf("Failed to connect to %s: %v (attempt %d/%d)", address, err, i+1, maxRetries)
+
+		// Wait before retrying
+		time.Sleep(retryDelay)
+	}
+
+	// Exhausted retries
+	return nil, fmt.Errorf("failed to connect to %s after %d retries: %v", address, maxRetries, err)
+}
 
 
 // Helper function to send the MapJobResponse
@@ -550,9 +837,6 @@ func (s *StorageNode) loadPlugin(jobId string, pluginData []byte) (mapFunc func(
 	// Initialize the plugin cache if it's nil
 	if s.pluginCache == nil {
 		s.pluginCache = make(map[string]MapReduceFunctions)
-	}
-	if s.pluginMutex == nil {
-		s.pluginMutex = &sync.Mutex{}
 	}
 	
 	s.pluginMutex.Lock()

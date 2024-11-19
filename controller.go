@@ -8,7 +8,6 @@ import (
 	"net"
 	"sync"
 	"math/rand"
-	"crypto/sha256"
 	"time"
 	"strings"
 	"strconv"
@@ -261,6 +260,9 @@ func (c *Controller) handleStorageNodeConnection(conn net.Conn) {
 		c.handleHeartbeat(req.GetHeartbeat(), conn)
 	case pb.RequestType_REPORT_CORRUPTION:
 		c.handleReportCorruption(req.GetReportCorruptedChunk(), conn)
+	case pb.RequestType_ALLOCATE_STORAGE:
+		log.Printf("Received allocate storage request")
+		c.handleAllocateStorage(req.GetAllocateStorage(), conn)
 	// Handle other client request types...
 	default:
 		log.Printf("Unknown request type from storage node")
@@ -510,10 +512,41 @@ func (c *Controller) handleClientConnection(conn net.Conn) {
 	case pb.RequestType_MAP_REDUCE_JOB:
 		log.Printf("Received MapReduce job request")
 		c.handleMapReduceJob(req.GetMapReduceJob(), conn) // Handle MapReduce job
+	case pb.RequestType_ACTUAL_CHUNK:
+		log.Printf("Received ActualChunkRequest")
+		c.handleActualChunk(req.GetActualChunk(), conn) 
 	default:
 		log.Printf("Unknown request type from client")
 	}
 }
+
+func (c *Controller) handleActualChunk(req *pb.ActualChunkRequest, conn net.Conn) {
+	// Extract filename and actual chunks from the request
+	filename := req.GetFilename()
+	actualChunks := int(req.GetActualChunks())
+
+	log.Printf("Handling ActualChunkRequest for file %s with %d actual chunks", filename, actualChunks)
+
+	// Lock the FileChunkMap to ensure thread safety
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+
+	// Retrieve the chunk allocations for the given filename
+	allocations, exists := c.FileChunkMap[filename]
+	if !exists {
+		log.Printf("File %s not found in FileChunkMap", filename)
+		return
+	}
+
+	// Remove chunk allocations with index >= actualChunks
+	if actualChunks < len(allocations) {
+		log.Printf("Trimming unused chunks for file %s. Keeping only first %d chunks.", filename, actualChunks)
+		c.FileChunkMap[filename] = allocations[:actualChunks]
+	} else {
+		log.Printf("No unused chunks to trim for file %s. All chunks are in use.", filename)
+	}
+}
+
 
 func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net.Conn) {
 	// Validate the MapReduce job request parameters
@@ -575,7 +608,7 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 		chunkNodeMap[chunkID] = selectedNode
 	}
 
-	// Step 3: Select reducers
+	// Step 3: Select reducers and assign random ports
 	var reducerNodes []*pb.StorageNodeInfo
 	reducerNum := int(jobReq.ReducerNum)
 
@@ -583,41 +616,40 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 		return c.nodeWorkload[selectedNodes[i].NodeId] < c.nodeWorkload[selectedNodes[j].NodeId]
 	})
 
+	// Track assigned ports for each node
+	assignedPorts := make(map[string]map[int]bool)
+
 	for i := 0; i < reducerNum && i < len(selectedNodes); i++ {
-		reducerNodes = append(reducerNodes, selectedNodes[i])
-	}
-
-	jobPort := assignPort(jobReq.JobId)
-
-	// Step 4: Assign map jobs to mapper nodes
-	// Assign map jobs to mapper nodes based on chunkNodeMap
-	for chunkID, node := range chunkNodeMap {
-		wg.Add(1)
-		go func(node *pb.StorageNodeInfo, chunkID string) {
-			defer wg.Done()
-
-			// Create the MapJobRequest
-			mapJobRequest := &pb.MapJobRequest{
-				JobId:      jobReq.JobId,
-				ChunkId:    chunkID,
-				Plugin:     jobReq.Plugin,
-				ReducerNum: int32(reducerNum),
-				Port:       int32(jobPort), // Shared port for reducers
-				Reducers:   reducerNodes,  // Send reducerNodes directly
+		node := selectedNodes[i]
+	
+		// Ensure the node has an assigned ports map
+		if _, exists := assignedPorts[node.NodeId]; !exists {
+			assignedPorts[node.NodeId] = make(map[int]bool)
+		}
+	
+		// Find an available random port
+		var port int
+		for {
+			port = randomPort() // Function to generate a random ephemeral port
+			if !assignedPorts[node.NodeId][port] {
+				assignedPorts[node.NodeId][port] = true
+				break
 			}
-
-			// Send the MapJobRequest to the storage node
-			success := c.sendJobToStorageNode(node, mapJobRequest)
-			c.Mutex.Lock()
-			defer c.Mutex.Unlock()
-			if success {
-				c.jobStatus[jobReq.JobId][chunkID] = true // Track mapper status
-			} else {
-				log.Printf("Mapper job failed for chunk %s on node %s", chunkID, node.NodeId)
-			}
-			c.nodeWorkload[node.NodeId]--
-		}(node, chunkID)
+		}
+	
+		// Create a copy of the node and assign the port
+		nodeCopy := &pb.StorageNodeInfo{
+			NodeId:       node.NodeId,
+			Address:      node.Address,
+			FreeSpace:    node.FreeSpace,
+			TotalRequests: node.TotalRequests,
+			Port:         int32(port),
+		}
+	
+		reducerNodes = append(reducerNodes, nodeCopy)
 	}
+	
+	log.Println("Assigned reducer nodes with ports:", reducerNodes)
 
 
 	// Step 5: Assign reduce jobs to reducer nodes (all reducers use the same jobPort)
@@ -627,7 +659,7 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 		reduceJobRequest := &pb.ReduceJobRequest{
 			JobId:      jobReq.JobId,
 			ReducerId:  reducerID,
-			Port:       int32(jobPort), // Shared port for reducers
+			Port:       node.Port, // Shared port for reducers
 			MapperNum:  int32(len(selectedNodes)),
 			Plugin:     jobReq.Plugin,
 		}
@@ -648,6 +680,37 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 			c.nodeWorkload[node.NodeId]--
 		}(node, reduceJobRequest)
 	}
+	
+	// Step 4: Assign map jobs to mapper nodes
+	// Assign map jobs to mapper nodes based on chunkNodeMap
+	for chunkID, node := range chunkNodeMap {
+		wg.Add(1)
+		go func(node *pb.StorageNodeInfo, chunkID string) {
+			defer wg.Done()
+
+			// Create the MapJobRequest
+			mapJobRequest := &pb.MapJobRequest{
+				JobId:      jobReq.JobId,
+				ChunkId:    chunkID,
+				Plugin:     jobReq.Plugin,
+				ReducerNum: int32(reducerNum),
+				Reducers:   reducerNodes,  // Send reducerNodes directly
+			}
+
+			// Send the MapJobRequest to the storage node
+			success := c.sendJobToStorageNode(node, mapJobRequest)
+			c.Mutex.Lock()
+			defer c.Mutex.Unlock()
+			if success {
+				c.jobStatus[jobReq.JobId][chunkID] = true // Track mapper status
+			} else {
+				log.Printf("Mapper job failed for chunk %s on node %s", chunkID, node.NodeId)
+			}
+			c.nodeWorkload[node.NodeId]--
+		}(node, chunkID)
+	}
+
+
 
 	// Wait for all goroutines to complete
 	wg.Wait()
@@ -692,17 +755,10 @@ func (c *Controller) handleMapReduceJob(jobReq *pb.MapReduceJobRequest, conn net
 	delete(c.jobStatus, jobReq.JobId)
 }
 
-func assignPort(jobId string) int {
-	minPort := 49152
-	maxPort := 65535
-	portRange := maxPort - minPort + 1
-
-	// Hash the JobId to get a deterministic value
-	hash := sha256.Sum256([]byte(jobId))
-	hashValue := int(hash[0])<<24 | int(hash[1])<<16 | int(hash[2])<<8 | int(hash[3])
-
-	// Map hash to a port in the range
-	return minPort + (hashValue % portRange)
+func randomPort() int {
+	rand.Seed(time.Now().UnixNano())
+	// Ephemeral ports range from 49152 to 65535
+	return rand.Intn(65535-49152) + 49152
 }
 
 func (c *Controller) selectNodeForChunk(chunk *pb.ChunkAllocation) *pb.StorageNodeInfo {
@@ -810,7 +866,8 @@ func (c *Controller) sendReducerJobToNode(node *pb.StorageNodeInfo, reduceJobReq
 		return false
 	}
 
-	log.Printf("Reducer job %s succeeded on node %s", reduceResponse.ReducerId, node.NodeId)
+	log.Printf("Reducer job %s succeeded on node %s, result file %s stored in the system", 
+	reduceResponse.ReducerId, node.NodeId, reduceResponse.ResultFilename)
 	return true
 }
 

@@ -20,6 +20,7 @@ enum RequestType {
   MAP_REDUCE_JOB = 11;     // Client to Controller: Request to start a MapReduce job
   MAP_JOB = 12;            // Controller to Storage Node: Request to start a Map job on a chunk
   REDUCE_JOB = 13;         // Controller to Storage Node: Request to start a Reduce job
+  ACTUAL_CHUNK = 14;
 }
 
 // Request message with oneof for different types of requests
@@ -41,6 +42,7 @@ message Request {
     MapReduceJobRequest map_reduce_job = 14;           // MapReduce job request
     MapJobRequest map_job = 15;                        // Map job request for storage nodes
     ReduceJobRequest reduce_job = 16;                  // Reduce job request for storage nodes
+    ActualChunkRequest actual_chunk = 17;
   }
 }
 
@@ -64,6 +66,11 @@ message Response {
     MapJobResponse map_job = 15;                        // Map job response from storage nodes
     ReduceJobResponse reduce_job = 16;                  // Reduce job response from storage nodes
   }
+}
+
+message ActualChunkRequest {
+  string filename = 1;   // Name of the file being processed
+  int32 actual_chunks = 2; // Number of chunks actually used
 }
 
 // Message for requesting a MapReduce job from client to controller
@@ -107,6 +114,7 @@ message ReduceJobResponse {
     string reducer_id = 2;          
     bool success = 3;              // Indicates if the Reduce job was successful
     string error_message = 4;      // Error message, if any
+    string result_filename = 5;
 }
 
 // Response message for MapReduce job request
@@ -228,11 +236,13 @@ message GetSystemInfoResponse {
 }
 
 message StorageNodeInfo {
-  string node_id = 1;
-  string address = 2;
-  int64 free_space = 3;
-  int64 total_requests = 4;
+  string node_id = 1;         // Unique ID for the storage node
+  string address = 2;         // IP or hostname of the storage node
+  int64 free_space = 3;       // Available disk space
+  int64 total_requests = 4;   // Total requests processed by this node
+  int32 port = 5;             // Port assigned to this node for reducer tasks
 }
+
 
 // Messages for adding a replica
 message AddReplicaRequest {

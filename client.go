@@ -44,15 +44,9 @@ func (c *Client) handlePut(filename string, chunkSize int) {
 		log.Fatalf("Cannot store directories")
 	}
 
-	// Determine if file is text-based for line-based chunking
-	isTextFile := c.isTextFile(file)
-	chunks, chunkErr := c.chunkFile(file, chunkSize, isTextFile)
-	if chunkErr != nil {
-		log.Fatalf("Failed to chunk file: %v", chunkErr)
-		return
-	}
 
-	chunkNum := int64(len(chunks)) // Get actual number of chunks after chunking
+
+	estimatedChunks := (fileInfo.Size()/int64(chunkSize)) + 1// Get actual number of chunks after chunking
 
 	// Send ALLOCATE_STORAGE request
 	allocateReq := &dfspb.Request{
@@ -61,7 +55,7 @@ func (c *Client) handlePut(filename string, chunkSize int) {
 			AllocateStorage: &dfspb.AllocateStorageRequest{
 				Filename: fileInfo.Name(),
 				FileSize: fileInfo.Size(),
-				ChunkNum: chunkNum, // Use real chunk number here
+				ChunkNum: estimatedChunks, // Use real chunk number here
 			},
 		},
 	}
@@ -81,59 +75,36 @@ func (c *Client) handlePut(filename string, chunkSize int) {
 		log.Fatalf("Failed to allocate storage: %v", resp.GetAllocateStorage().ErrorMessage)
 	}
 
-	for i, chunk := range chunks {
-		// Calculate checksum for the chunk
-		checksum := c.calculateChecksum(chunk)
-
-		// Get the storage node address for this chunk
-		if i >= len(allocations) {
-			log.Fatalf("Chunk allocation missing for chunk %d", i)
-		}
-		alloc := allocations[i]
-
-		// Check if there's at least one node allocated for this chunk
-		if len(alloc.Nodes) == 0 {
-			log.Fatalf("No storage node allocated for chunk %d", i)
-		}
-
-		storageAddr := alloc.Nodes[0].Address
-
-		// Connect to the storage node
-		storageConn, err := net.Dial("tcp", storageAddr)
-		if err != nil {
-			log.Fatalf("Failed to connect to storage node %s: %v", storageAddr, err)
-		}
-		defer storageConn.Close()
-
-		// Send StoreChunkRequest
-		storeReq := &dfspb.Request{
-			Type: dfspb.RequestType_STORE_CHUNK,
-			Request: &dfspb.Request_StoreChunk{
-				StoreChunk: &dfspb.StoreChunkRequest{
-					ChunkId:  fmt.Sprintf("%s_%d", fileInfo.Name(), i),
-					Data:     chunk,
-					Checksum: checksum,
-					Nodes: alloc.Nodes[1:],
-				},
-			},
-		}
-
-		if err := c.sendRequest(storageConn, storeReq); err != nil {
-			log.Fatalf("Failed to send store chunk request: %v", err)
-		}
-
-		// Handle the response from the storage node
-		storeResp, err := c.readResponse(storageConn)
-		if err != nil {
-			log.Fatalf("Failed to read response from storage node: %v", err)
-		}
-
-		if !storeResp.GetStoreChunk().Success {
-			log.Fatalf("Failed to store chunk %d: %v", i, storeResp.GetStoreChunk().ErrorMessage)
-		}
-
-		log.Printf("Stored chunk %d successfully", i)
+	// Determine if file is text-based for line-based chunking
+	isTextFile := c.isTextFile(file)
+	chunksNum, err := c.chunkFile(file, fileInfo.Name(), chunkSize, isTextFile, allocations)
+	if err != nil {
+		log.Fatalf("Failed to chunk file: %v", err)
+		return
 	}
+	log.Printf("%d chunks stored ", chunksNum)
+	// Create the ActualChunkRequest message
+	actualChunkRequest := &dfspb.Request{
+		Type: dfspb.RequestType_ACTUAL_CHUNK,
+		Request: &dfspb.Request_ActualChunk{
+			ActualChunk: &dfspb.ActualChunkRequest{
+				Filename:     fileInfo.Name(),
+				ActualChunks: int32(chunksNum),
+			},
+		},
+	}
+	conn, err = net.Dial("tcp", c.ControllerAddr)
+	if err != nil {
+		log.Fatalf("Failed to connect to controller: %v", err)
+	}
+	defer conn.Close()
+		// Send the ActualChunkRequest
+	if err := c.sendRequest(conn, actualChunkRequest); err != nil {
+		log.Fatalf("Failed to send ActualChunkRequest: %v", err)
+	}
+
+	log.Printf("ActualChunkRequest sent for file %s with %d chunks", fileInfo.Name(), chunksNum)
+
 }
 
 func (c *Client) isTextFile(file *os.File) bool {
@@ -153,80 +124,106 @@ func (c *Client) isTextFile(file *os.File) bool {
 	return false // Return false if the extension doesn't match any text types
 }
 
-func (c *Client) chunkFile(file *os.File, chunkSize int, isTextFile bool) ([][]byte, error) {
-    var chunks [][]byte
-    
-    if isTextFile {
-        // Create a reader with a buffer size at least as large as our chunk size
-        reader := bufio.NewReaderSize(file, chunkSize)
-        buffer := make([]byte, chunkSize)
-        
-        for {
-            // Read full chunk directly from file
-            n, err := io.ReadFull(reader, buffer)
-            if n > 0 {
-                currentChunk := buffer[:n]
-                
-                // If chunk doesn't end with newline, read until we find one
-                if currentChunk[len(currentChunk)-1] != '\n' {
-                    lineEnd, err := reader.ReadBytes('\n')
-                    if len(lineEnd) > 0 {
-                        // Create complete chunk with the line ending
-                        completeChunk := make([]byte, len(currentChunk)+len(lineEnd))
-                        copy(completeChunk, currentChunk)
-                        copy(completeChunk[len(currentChunk):], lineEnd)
-                        chunks = append(chunks, completeChunk)
-                    } else {
-                        // No more data, use current chunk as is
-                        chunk := make([]byte, len(currentChunk))
-                        copy(chunk, currentChunk)
-                        chunks = append(chunks, chunk)
-                    }
-                    
-                    if err == io.EOF {
-                        break
-                    }
-                    if err != nil && err != io.EOF {
-                        return nil, fmt.Errorf("error reading line end: %w", err)
-                    }
-                } else {
-                    // Current chunk ends with newline
-                    chunk := make([]byte, len(currentChunk))
-                    copy(chunk, currentChunk)
-                    chunks = append(chunks, chunk)
+func (c *Client) chunkFile(file *os.File, fileName string, chunkSize int, isTextFile bool, allocations []*dfspb.ChunkAllocation) (int, error) {
+    // Create a buffered reader
+    reader := bufio.NewReaderSize(file, chunkSize)
+    buffer := make([]byte, chunkSize)
+    chunksUsed := 0
+
+    for i := 0; i < len(allocations); i++ {
+        n, err := io.ReadFull(reader, buffer)
+        if n > 0 {
+            chunk := buffer[:n]
+
+            // Handle text-based files: ensure chunk ends with a newline
+            if isTextFile && chunk[len(chunk)-1] != '\n' {
+                lineEnd, err := reader.ReadBytes('\n')
+                if len(lineEnd) > 0 {
+                    chunk = append(chunk, lineEnd...)
+                }
+                if err != nil && err != io.EOF {
+                    return chunksUsed, fmt.Errorf("error reading line end for chunk %d: %w", i, err)
                 }
             }
-            
-            // Handle the various error cases from ReadFull
-            if err == io.EOF || err == io.ErrUnexpectedEOF {
-                break
+
+            // Store the chunk
+            if err := c.storeChunk(allocations, i, chunk, fileName); err != nil {
+                return chunksUsed, fmt.Errorf("failed to store chunk %d: %w", i, err)
             }
-            if err != nil {
-                return nil, fmt.Errorf("error reading chunk: %w", err)
-            }
+
+            chunksUsed++ // Increment the counter for every successfully processed chunk
         }
-    } else {
-        buffer := make([]byte, chunkSize)
-        for {
-            n, err := file.Read(buffer)
-            if n > 0 {
-                chunk := make([]byte, n)
-                copy(chunk, buffer[:n])
-                chunks = append(chunks, chunk)
-            }
-            
-            if err == io.EOF {
-                break
-            }
-            if err != nil {
-                return nil, fmt.Errorf("error reading binary file: %w", err)
-            }
+
+        // Handle end of file or unexpected EOF
+        if err == io.EOF || err == io.ErrUnexpectedEOF {
+            break
+        }
+        if err != nil {
+            return chunksUsed, fmt.Errorf("error reading chunk %d: %w", i, err)
         }
     }
-    
-    return chunks, nil
+
+    return chunksUsed, nil
 }
 
+
+
+func (c *Client) storeChunk(allocations []*dfspb.ChunkAllocation, index int, chunk []byte, fileName string) error {
+    // Ensure the allocation exists for the given chunk index
+    if index >= len(allocations) {
+        return fmt.Errorf("chunk allocation missing for chunk %d", index)
+    }
+
+    alloc := allocations[index]
+
+    // Ensure at least one storage node is allocated for this chunk
+    if len(alloc.Nodes) == 0 {
+        return fmt.Errorf("no storage node allocated for chunk %d", index)
+    }
+
+    // Calculate the checksum for the chunk
+    checksum := c.calculateChecksum(chunk)
+
+    // Connect to the primary storage node
+    storageAddr := alloc.Nodes[0].Address
+    storageConn, err := net.Dial("tcp", storageAddr)
+    if err != nil {
+        return fmt.Errorf("failed to connect to storage node %s: %w", storageAddr, err)
+    }
+    defer storageConn.Close()
+
+    // Prepare the store chunk request
+    storeReq := &dfspb.Request{
+        Type: dfspb.RequestType_STORE_CHUNK,
+        Request: &dfspb.Request_StoreChunk{
+            StoreChunk: &dfspb.StoreChunkRequest{
+                ChunkId:  fmt.Sprintf("%s_%d", fileName, index),
+                Data:     chunk,
+                Checksum: checksum,
+                Nodes:    alloc.Nodes[1:], // Remaining nodes for replication
+            },
+        },
+    }
+
+    // Send the store chunk request
+    if err := c.sendRequest(storageConn, storeReq); err != nil {
+        return fmt.Errorf("failed to send store chunk request for chunk %d: %w", index, err)
+    }
+
+    // Read the response from the storage node
+    storeResp, err := c.readResponse(storageConn)
+    if err != nil {
+        return fmt.Errorf("failed to read response from storage node for chunk %d: %w", index, err)
+    }
+
+    // Check if the storage was successful
+    if !storeResp.GetStoreChunk().Success {
+        return fmt.Errorf("failed to store chunk %d: %v", index, storeResp.GetStoreChunk().ErrorMessage)
+    }
+
+    log.Printf("Stored chunk %d successfully", index)
+    return nil
+}
 
 // Calculate checksum for a chunk of data
 func (c *Client) calculateChecksum(data []byte) string {
@@ -656,7 +653,7 @@ func main() {
 	switch strings.ToLower(action) {
 	case "put":
 		filename := os.Args[2]
-		chunkSize := 100// Default chunk size is 10 MB
+		chunkSize := 400// Default chunk size is 10 MB
 		if len(os.Args) == 4 {
 			size, err := strconv.Atoi(os.Args[3])
 			if err != nil || size <= 0 {
