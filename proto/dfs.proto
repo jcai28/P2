@@ -106,6 +106,7 @@ message ReduceJobRequest {
     int32   port = 3;            // The port this for mapper reducer connection
     int32  mapper_num = 4;     // Values associated with this key, grouped from Map output
     bytes   plugin = 5;       // Binary data of the reduce plugin file
+    string input_file = 6;
 }
 
 // Response message from the storage node after processing a Reduce job
@@ -119,12 +120,11 @@ message ReduceJobResponse {
 
 // Response message for MapReduce job request
 message MapReduceJobResponse {
-    string job_id = 1;
-    bool success = 2;
-    string error_message = 3;
+  string job_id = 1;
+  bool success = 2;
+ bool finished =3;
+  string message = 4;
 }
-
-
 
 // Messages for Heartbeat
 message HeartbeatRequest {

@@ -320,7 +320,7 @@ func (s *StorageNode) handleReduceJob(request *dfspb.ReduceJobRequest, conn net.
 	}
 
 	// Combine sorted outputs and apply the reduce function
-	combinedFilePattern := fmt.Sprintf("%s/combined_reducer_output_%s_part_%%d.txt", s.StorageDir, request.JobId)
+	combinedFilePattern := fmt.Sprintf("%s/combined_reducer_output_%s_%s_part_%%d.txt", s.StorageDir, request.ReducerId, request.InputFile)
 	err = s.combineSortedOutput(request.JobId, request.ReducerId, outputFilePattern, numReducers, combinedFilePattern, reduceFunc)
 	if err != nil {
 		log.Printf("Error combining sorted output for job %s: %v", request.JobId, err)
@@ -383,6 +383,14 @@ func (s *StorageNode) handleReduceJob(request *dfspb.ReduceJobRequest, conn net.
 		// No errors, continue
 		log.Printf("File %s stored successfully in DFS.", combinedFileName)
 	}
+
+	err = os.Remove(combinedFileName)
+	if err != nil {
+		log.Printf("Failed to delete temporary file %s: %v", combinedFileName, err)
+	} else {
+		log.Printf("Deleted temporary file: %s", combinedFileName)
+	}
+
 
 	// Step 4: Send Success Response to the Controller
 	s.sendResponse(conn, &dfspb.Response{
@@ -714,6 +722,12 @@ func (s *StorageNode) handleMapJob(mapJob *dfspb.MapJobRequest, conn net.Conn) {
 			s.sendMapJobResponse(conn, mapJob.JobId, mapJob.ChunkId, false, fmt.Sprintf("Failed to send to reducer %d: %v", i, err))
 			return
 		}
+		err = os.Remove(reducerFile)
+		if err != nil {
+			log.Printf("Failed to delete temporary file %s: %v", reducerFile, err)
+		} else {
+			log.Printf("Deleted temporary file: %s", reducerFile)
+		}
 	}
 
 	log.Printf("Map function executed, output sorted, combined, and sent to reducers successfully for job ID %s on chunk ID %s", mapJob.JobId, mapJob.ChunkId)
@@ -729,7 +743,6 @@ func (s *StorageNode) sendToReducer(filePath, address string, port int32, chunkI
 	if err != nil {
 		host = address // If no port exists, treat as host
 	}
-	log.Printf("the port is %d", port)
 	// Check if the host is the local machine
 	localIP := getLocalIP()
 	isLocal := (host == localIP )
@@ -970,6 +983,12 @@ func (s *StorageNode) combineSortedOutput(
 		}
 
 		writer.Flush()
+		err = os.Remove(inputFileName)
+		if err != nil {
+			log.Printf("Failed to delete temporary file %s: %v", inputFileName, err)
+		} else {
+			log.Printf("Deleted temporary file: %s", inputFileName)
+		}
 	}
 
 	return nil

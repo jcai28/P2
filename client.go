@@ -131,7 +131,7 @@ func (c *Client) chunkFile(file *os.File, fileName string, chunkSize int, isText
     chunksUsed := 0
 
     for i := 0; i < len(allocations); i++ {
-        n, err := io.ReadFull(reader, buffer)
+        n, err := reader.Read(buffer)
         if n > 0 {
             chunk := buffer[:n]
 
@@ -569,7 +569,7 @@ func (c *Client) sendMapReduceJobRequest(jobID string, inputFilePath string, plu
 
 	// Wrap the MapReduceJobRequest in a generic Request with type set to map_reduce_job
 	req := &dfspb.Request{
-		Type: dfspb.RequestType_MAP_REDUCE_JOB, // Set the request type appropriately
+		Type: dfspb.RequestType_MAP_REDUCE_JOB,
 		Request: &dfspb.Request_MapReduceJob{
 			MapReduceJob: mapReduceJobRequest,
 		},
@@ -580,21 +580,37 @@ func (c *Client) sendMapReduceJobRequest(jobID string, inputFilePath string, plu
 		return fmt.Errorf("failed to send MapReduce job request: %v", err)
 	}
 
-	// Read the response from the controller
-	resp, err := c.readResponse(conn)
-	if err != nil {
-		return fmt.Errorf("failed to receive response from controller: %v", err)
-	}
+	log.Printf("MapReduce job %s submitted successfully. Monitoring job status...", jobID)
 
-	// Check if the job was successfully submitted
-	mapReduceResponse := resp.GetMapReduceJob()
-	if mapReduceResponse == nil || !mapReduceResponse.Success {
-		return fmt.Errorf("MapReduce job submission failed: %s", mapReduceResponse.GetErrorMessage())
-	}
+	// Monitor responses from the controller
+	for {
+		// Read the response from the controller
+		resp, err := c.readResponse(conn)
+		if err != nil {
+			return fmt.Errorf("failed to receive response from controller: %v", err)
+		}
 
-	log.Printf("MapReduce job %s submitted successfully.", jobID)
-	return nil
+		// Extract the MapReduceJobResponse
+		mapReduceResponse := resp.GetMapReduceJob()
+		if mapReduceResponse == nil {
+			return fmt.Errorf("received an invalid response from controller")
+		}
+
+		// Log the status message
+		log.Printf("Job %s status update: %s", mapReduceResponse.JobId, mapReduceResponse.Message)
+
+		// Check if the job has finished
+		if mapReduceResponse.Finished {
+			if mapReduceResponse.Success {
+				log.Printf("MapReduce job %s completed successfully.", mapReduceResponse.JobId)
+				return nil
+			} else {
+				return fmt.Errorf("MapReduce job %s failed: %s", mapReduceResponse.JobId, mapReduceResponse.Message)
+			}
+		}
+	}
 }
+
 
 // Send a protobuf request over the connection
 func (c *Client) sendRequest(conn net.Conn, req *dfspb.Request) error {
